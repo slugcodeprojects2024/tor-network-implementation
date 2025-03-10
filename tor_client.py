@@ -73,31 +73,28 @@ class DirectoryService:
             print(f"Error requesting private nodes: {e}")
             return {}
     
-    def build_circuit(self, length=3, prefer_private=False):
-        """Build a circuit of specified length, optionally preferring private nodes"""
+    def build_circuit(self, length=2, prefer_private=False):
+        """Build a circuit of specific nodes for testing"""
         if not self.known_nodes:
             self.request_node_list()
             
-        if len(self.known_nodes) < length:
-            raise ValueError(f"Not enough nodes available. Need {length}, have {len(self.known_nodes)}")
-        
-        # Get node IDs and convert to list for random selection
-        node_ids = list(self.known_nodes.keys())
-        
-        # Simple random selection for now
-        # In a real implementation, you might want to consider node diversity, 
-        # reliability, bandwidth, etc.
-        selected_ids = random.sample(node_ids, length)
-        
-        # Build the circuit with node information
+        # For testing, use node 0 and node 1 in that order
         circuit = []
-        for node_id in selected_ids:
+        if 0 in self.known_nodes:
             circuit.append({
-                'id': node_id,
-                'address': self.known_nodes[node_id]['address'],
-                'public_key': self.known_nodes[node_id]['public_key']
+                'id': 0,
+                'address': self.known_nodes[0]['address'],
+                'public_key': self.known_nodes[0]['public_key']
+            })
+        
+        if 1 in self.known_nodes:
+            circuit.append({
+                'id': 1, 
+                'address': self.known_nodes[1]['address'],
+                'public_key': self.known_nodes[1]['public_key']
             })
             
+        print(f"Created fixed circuit: Node 0 → Node 1")
         return circuit
 
 class TorClient:
@@ -162,78 +159,82 @@ class TorClient:
         data = request_data  # Start with the plaintext HTTP request
         print(f"Original request: {data[:50]}")
         
-        # Build the onion from the exit node back to the entry node
-        for i in range(len(circuit) - 1, -1, -1):
-            node = circuit[i]
-            print(f"Layer {i}: Using node {node['id']}")
-            
-            if i > 0:  # If not the entry node, include the next hop's address
-                next_node = circuit[i-1]
-                next_ip, next_port = next_node['address']
-                
-                # Format with very clear prefix
-                message = f"ROUTE:{next_ip}:{next_port}:".encode() + data
-                print(f"Layer {i}: Adding routing to {next_ip}:{next_port}")
-                print(f"Layer {i}: Message starts with: {message[:50]}")
-                
-                # Use node's public key to encrypt
-                data = self.encrypt_layer(message, node['public_key'])
-                print(f"Layer {i}: Encrypted size: {len(data)}")
-            else:
-                # Entry node (outermost layer)
-                print(f"Layer {i}: Final encryption for entry node")
-                data = self.encrypt_layer(data, node['public_key'])
-                print(f"Layer {i}: Final encrypted size: {len(data)}")
+        # Start with exit node (Node 1)
+        exit_node = circuit[-1]
+        print(f"Exit node is Node {exit_node['id']}")
         
-        print(f"Final encrypted data size: {len(data)} bytes")        
+        # First, encrypt with exit node's key
+        data = self.encrypt_layer(data, exit_node['public_key'])
+        print(f"Encrypted data with exit node's key, size: {len(data)}")
+        
+        # Then add routing and encrypt with entry node's key (Node 0)
+        entry_node = circuit[0]
+        exit_node_ip, exit_node_port = exit_node['address']
+        
+        # Add routing prefix
+        routing_prefix = f"ROUTE:{exit_node_ip}:{exit_node_port}:".encode()
+        print(f"Adding routing to exit node: {exit_node_ip}:{exit_node_port}")
+        
+        # Combine routing prefix with already encrypted data
+        message = routing_prefix + data
+        
+        # Encrypt with entry node's key
+        data = self.encrypt_layer(message, entry_node['public_key'])
+        print(f"Encrypted with entry node's key, final size: {len(data)}")
+        
         return data
     
-    def send_request(self, entry_node, encrypted_data):
-        """Send the request to the entry node and get the response"""
+    def send_request(self, circuit, encrypted_data):
+        """Send the request through the first node in the circuit"""
         try:
+            # Get the entry node (first in the circuit)
+            entry_node = circuit[0]
+            
+            print(f"Connecting to entry node {entry_node['id']} at {entry_node['address']}")
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect(entry_node['address'])
-                print(f"Connected to entry node at {entry_node['address']}")
                 
                 # Send the encrypted data
                 s.sendall(encrypted_data)
                 print("Request sent, waiting for response...")
                 
                 # Receive the response
-                # In a real implementation, you'd need to handle chunking for large responses
-                s.settimeout(10.0)  # Set a reasonable timeout
+                s.settimeout(20.0)  # Longer timeout
                 response = b""
-                while True:
-                    try:
-                        chunk = s.recv(4096)
+                
+                try:
+                    while True:
+                        chunk = s.recv(8192)  # Larger buffer
                         if not chunk:
+                            print("Connection closed by server")
                             break
                         response += chunk
-                    except socket.timeout:
-                        break
-                        
-                return response
+                        print(f"Received chunk: {len(chunk)} bytes, total: {len(response)}")
+                except socket.timeout:
+                    print("Socket timeout, ending receive")
+                
+                if response:
+                    print(f"Total response size: {len(response)} bytes")
+                    return response
+                else:
+                    print("No response received")
+                    return None
         except Exception as e:
             print(f"Error sending request: {e}")
             return None
             
-    def browse(self, destination_host, request_path="/", circuit_length=3, use_private=False):
+    def browse(self, destination_host, request_path="/", circuit_length=2, use_private=False):
         """
         Main method to send a request through the Tor network
-        Returns the response from the destination server
         """
-        # 1. Set up directory service and get node information
-        self.directory_service.request_node_list()  # Always get public nodes
-        
-        # Additionally get private nodes if requested
+        # 1. Get node information
+        self.directory_service.request_node_list()
         if use_private and self.auth_token:
             self.directory_service.request_private_nodes(self.auth_token)
             
-        print(f"Total nodes available: {len(self.directory_service.known_nodes)}")
-            
         # 2. Build a circuit
         try:
-            circuit = self.directory_service.build_circuit(length=circuit_length, prefer_private=use_private)
+            circuit = self.directory_service.build_circuit(length=circuit_length)
             print(f"Built circuit with {len(circuit)} nodes")
         except ValueError as e:
             print(f"Error building circuit: {e}")
@@ -246,10 +247,8 @@ class TorClient:
         encrypted_request = self.build_onion_request(circuit, request)
         
         # 5. Send the request through the entry node
-        entry_node = circuit[0]
-        response = self.send_request(entry_node, encrypted_request)
+        response = self.send_request(circuit, encrypted_request)
         
-        # 6. Return the response (already decrypted by the exit node)
         return response
 
 # Generate RSA key pair using cryptography library
@@ -318,7 +317,9 @@ def test_single_node_encryption():
     
     print("\n=== ENCRYPTION TEST COMPLETE ===\n")
 
-DESTINATION_HOST = "www.google.com"
+# Update the destination host
+DESTINATION_HOST = "httpbin.org"
+
 def main():
     # Create a directory service
     directory_service = DirectoryService()
@@ -335,8 +336,8 @@ def main():
     # Set use_private=True to use private nodes if available
     response = tor_client.browse(
         destination_host=DESTINATION_HOST,
-        request_path="/",
-        circuit_length=2,  # Minimum of 2 per requirements
+        request_path="/get",  # Simple endpoint that returns JSON
+        circuit_length=2,
         use_private=True
     )
     
