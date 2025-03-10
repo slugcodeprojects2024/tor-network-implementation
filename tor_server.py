@@ -245,16 +245,21 @@ class Node:
         try:
             print(f"Node {self.id}: Forwarding {len(data)} bytes to {ip}:{port}")
             
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            # Create a new socket for this connection
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(30.0)  # Longer timeout
+            
+            try:
+                # Connect to the next node
                 s.connect((ip, port))
+                
                 # Send the data
                 s.sendall(data)
                 
-                # Receive response with better handling
-                s.settimeout(15.0)  # Longer timeout
+                print(f"Node {self.id}: Waiting for response from {ip}:{port}")
+                # Receive response
                 response = b""
                 
-                print(f"Node {self.id}: Waiting for response from {ip}:{port}")
                 try:
                     while True:
                         chunk = s.recv(8192)
@@ -263,11 +268,18 @@ class Node:
                             break
                         response += chunk
                         print(f"Node {self.id}: Received chunk of {len(chunk)} bytes from {ip}:{port}")
+                        
+                        # If we got a substantial response, we can return it
+                        if len(response) > 0:
+                            break
                 except socket.timeout:
                     print(f"Node {self.id}: Socket timeout waiting for response from {ip}:{port}")
                 
                 print(f"Node {self.id}: Total response size from {ip}:{port}: {len(response)} bytes")
                 return response
+            finally:
+                # Always close the socket when done
+                s.close()
         except Exception as e:
             print(f"Node {self.id}: Error forwarding to {ip}:{port}: {e}")
             return None
@@ -374,8 +386,12 @@ class Node:
                     # Send response back through the circuit
                     if response:
                         print(f"Node {self.id}: Sending HTTP response back, {len(response)} bytes")
-                        conn.sendall(response)
-                        print(f"Node {self.id}: Response sent successfully")
+                        try:
+                            # Send the response back to the original connection
+                            conn.sendall(response)
+                            print(f"Node {self.id}: Response sent successfully through original connection")
+                        except Exception as e:
+                            print(f"Node {self.id}: Error sending response: {e}")
                     else:
                         print(f"Node {self.id}: No response from HTTP request")
                         conn.sendall(b"ERROR: No response from target server")

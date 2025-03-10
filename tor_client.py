@@ -198,26 +198,31 @@ class TorClient:
                 s.sendall(encrypted_data)
                 print("Request sent, waiting for response...")
                 
-                # Receive the response
-                s.settimeout(20.0)  # Longer timeout
+                # Use shorter timeouts but retry more
+                s.settimeout(5.0)
                 response = b""
+                max_attempts = 6  # Try for about 30 seconds total
                 
-                try:
-                    while True:
-                        chunk = s.recv(8192)  # Larger buffer
-                        if not chunk:
+                for attempt in range(max_attempts):
+                    try:
+                        chunk = s.recv(8192)
+                        if chunk:
+                            response += chunk
+                            print(f"Received chunk: {len(chunk)} bytes, total: {len(response)}")
+                        else:
                             print("Connection closed by server")
                             break
-                        response += chunk
-                        print(f"Received chunk: {len(chunk)} bytes, total: {len(response)}")
-                except socket.timeout:
-                    print("Socket timeout, ending receive")
+                    except socket.timeout:
+                        print(f"Socket timeout (attempt {attempt+1}/{max_attempts})")
+                        # Only exit if we've tried enough times
+                        if attempt == max_attempts - 1:
+                            break
                 
                 if response:
                     print(f"Total response size: {len(response)} bytes")
                     return response
                 else:
-                    print("No response received")
+                    print("No response received after multiple attempts")
                     return None
         except Exception as e:
             print(f"Error sending request: {e}")
