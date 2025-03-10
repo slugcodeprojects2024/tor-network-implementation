@@ -65,7 +65,7 @@ class NodeDirectoryService:
                 s.sendall(message)
                 
                 # Get response
-                response = s.recv(1024)
+                response = s.recv(1024)   
                 success = response.decode() == "SUCCESS"
                 
                 if success:
@@ -252,9 +252,13 @@ class Node:
             try:
                 # Connect to the next node
                 s.connect((ip, port))
-                
+
                 # Send the data
                 s.sendall(data)
+
+                #Send End indicator
+                end = f"::END::".encode()
+                s.sendall(end)
                 
                 print(f"Node {self.id}: Waiting for response from {ip}:{port}")
                 # Receive response
@@ -267,6 +271,8 @@ class Node:
                             print(f"Node {self.id}: Connection closed by {ip}:{port}")
                             break
                         response += chunk
+                        if b"::END::" in chunk:
+                            break
                         print(f"Node {self.id}: Received chunk of {len(chunk)} bytes from {ip}:{port}")
                         
                         # If we got a substantial response, we can return it
@@ -303,17 +309,20 @@ class Node:
                     print(f"Node {self.id}: Request sent to {host}")
                     
                     # Receive the response in chunks
-                    ssl_socket.settimeout(10.0)
+                    ssl_socket.settimeout(1.0)
                     response = b""
+                    content_length = 2**63
                     try:
                         while True:
                             chunk = ssl_socket.recv(4096)
                             if not chunk:
                                 break
                             response += chunk
+                    
                             print(f"Node {self.id}: Received chunk of {len(chunk)} bytes")
                     except socket.timeout:
                         print(f"Node {self.id}: Socket timeout after receiving {len(response)} bytes")
+                        chunk += response
                     
                     print(f"Node {self.id}: Total response size: {len(response)} bytes")
                     return response
@@ -336,6 +345,8 @@ class Node:
                     if not chunk:
                         break
                     data += chunk
+                    if b"::END::" in chunk:
+                        break
                 except socket.timeout:
                     break
             
@@ -372,7 +383,11 @@ class Node:
                     # Return the response back through the circuit
                     print(f"Node {self.id}: Got response from next node, {len(response)} bytes")
                     print(f"Node {self.id}: Sending response back to client")
+                    
                     conn.sendall(response)
+                    # Append end indicator
+                    end = f"::END::".encode()
+                    conn.sendall(end)
                     print(f"Node {self.id}: Response sent back successfully")
                 else:
                     print(f"Node {self.id}: No response from next node")
@@ -389,6 +404,8 @@ class Node:
                         try:
                             # Send the response back to the original connection
                             conn.sendall(response)
+                            end = f"::END::".encode()
+                            conn.sendall(end)
                             print(f"Node {self.id}: Response sent successfully through original connection")
                         except Exception as e:
                             print(f"Node {self.id}: Error sending response: {e}")

@@ -5,6 +5,7 @@ import ssl
 import base64
 import json
 import random
+import argparse
 from time import sleep
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
@@ -73,13 +74,15 @@ class DirectoryService:
             print(f"Error requesting private nodes: {e}")
             return {}
     
-    def build_circuit(self, length=2, prefer_private=False):
+    def build_circuit(self, length=3, prefer_private=False):
         """Build a circuit of specific nodes for testing"""
         if not self.known_nodes:
             self.request_node_list()
             
-        # For testing, use node 0 and node 1 in that order
+        # For a 3-node circuit, use nodes 0, 1, and 2 in order
         circuit = []
+        
+        # Add Node 0 (entry node)
         if 0 in self.known_nodes:
             circuit.append({
                 'id': 0,
@@ -87,14 +90,23 @@ class DirectoryService:
                 'public_key': self.known_nodes[0]['public_key']
             })
         
+        # Add Node 1 (middle node)
         if 1 in self.known_nodes:
             circuit.append({
                 'id': 1, 
                 'address': self.known_nodes[1]['address'],
                 'public_key': self.known_nodes[1]['public_key']
             })
+        
+        # Add Node 2 (exit node)
+        if 2 in self.known_nodes:
+            circuit.append({
+                'id': 2, 
+                'address': self.known_nodes[2]['address'],
+                'public_key': self.known_nodes[2]['public_key']
+            })
             
-        print(f"Created fixed circuit: Node 0 → Node 1")
+        print(f"Created fixed circuit: Node 0 → Node 1 → Node 2")
         return circuit
 
 class TorClient:
@@ -154,33 +166,36 @@ class TorClient:
         return encrypted_data
     
     def build_onion_request(self, circuit, request_data):
-        """Build a layered encrypted request"""
+        """Build a layered encrypted request for a circuit of any length"""
         print(f"Building onion with {len(circuit)} layers")
         data = request_data  # Start with the plaintext HTTP request
         print(f"Original request: {data[:50]}")
         
-        # Start with exit node (Node 1)
-        exit_node = circuit[-1]
+        # Start with the exit node (last in the circuit)
+        exit_node_index = len(circuit) - 1
+        exit_node = circuit[exit_node_index]
         print(f"Exit node is Node {exit_node['id']}")
         
         # First, encrypt with exit node's key
         data = self.encrypt_layer(data, exit_node['public_key'])
-        print(f"Encrypted data with exit node's key, size: {len(data)}")
+        print(f"Encrypted with exit node's (Node {exit_node['id']}) key, size: {len(data)}")
         
-        # Then add routing and encrypt with entry node's key (Node 0)
-        entry_node = circuit[0]
-        exit_node_ip, exit_node_port = exit_node['address']
-        
-        # Add routing prefix
-        routing_prefix = f"ROUTE:{exit_node_ip}:{exit_node_port}:".encode()
-        print(f"Adding routing to exit node: {exit_node_ip}:{exit_node_port}")
-        
-        # Combine routing prefix with already encrypted data
-        message = routing_prefix + data
-        
-        # Encrypt with entry node's key
-        data = self.encrypt_layer(message, entry_node['public_key'])
-        print(f"Encrypted with entry node's key, final size: {len(data)}")
+        # For each remaining node, working backward
+        for i in range(exit_node_index - 1, -1, -1):
+            current_node = circuit[i]
+            next_node = circuit[i + 1]
+            next_ip, next_port = next_node['address']
+            
+            # Add routing prefix for current node to forward to next node
+            routing_prefix = f"ROUTE:{next_ip}:{next_port}:".encode()
+            print(f"Adding routing to node {next_node['id']}: {next_ip}:{next_port}")
+            
+            # Combine routing prefix with already encrypted data
+            data = routing_prefix + data
+            
+            # Encrypt with current node's key
+            data = self.encrypt_layer(data, current_node['public_key'])
+            print(f"Encrypted with node {current_node['id']}'s key, size: {len(data)}")
         
         return data
     
@@ -194,7 +209,11 @@ class TorClient:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect(entry_node['address'])
                 
-                # Send the encrypted data
+                # Add a end delimiter
+                end = f"::END::".encode()
+                encrypted_data += end
+
+                # Send the encrypted data   
                 s.sendall(encrypted_data)
                 print("Request sent, waiting for response...")
                 
@@ -209,6 +228,11 @@ class TorClient:
                         if chunk:
                             response += chunk
                             print(f"Received chunk: {len(chunk)} bytes, total: {len(response)}")
+                            if b"::END::" in response:
+                                reply = response.split(b"::END::")
+                                response = reply[0]
+                                break
+                           
                         else:
                             print("Connection closed by server")
                             break
@@ -325,33 +349,38 @@ def test_single_node_encryption():
 # Update the destination host
 DESTINATION_HOST = "httpbin.org"
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Tor-like client implementation')
+    parser.add_argument('--private', action='store_true', help='Use private nodes')
+    parser.add_argument('--token', type=str, default="secret_token_123", help='Auth token for private nodes')
+    return parser.parse_args()
+
 def main():
+    args = parse_arguments()
+    
     # Create a directory service
     directory_service = DirectoryService()
     
-    # Create a Tor client with the directory service
-    # Optionally provide an auth token for private nodes
-    auth_token = "secret_token_123"  # This would be agreed upon with your partner
+    # Create a Tor client with the directory service and optional auth token
+    auth_token = args.token if args.private else None
     tor_client = TorClient(directory_service, auth_token)
     
-    # Test single node encryption
-    test_single_node_encryption()
+    print(f"\n=== TESTING WITH {'PRIVATE' if args.private else 'PUBLIC'} NODES ===\n")
     
     # Use the client to browse through the Tor network
-    # Set use_private=True to use private nodes if available
     response = tor_client.browse(
         destination_host=DESTINATION_HOST,
-        request_path="/get",  # Simple endpoint that returns JSON
-        circuit_length=2,
-        use_private=True
+        request_path="/get",
+        circuit_length=3,
+        use_private=args.private
     )
     
     if response:
-        # Print the response
-        print("Response received:")
+        print(f"\nResponse received through {'private' if args.private else 'public'} node circuit!")
+        print("Response content:")
         print(response.decode(errors='replace'))
     else:
-        print("Failed to get a response")
+        print(f"\nFailed to get a response through {'private' if args.private else 'public'} nodes")
 
 if __name__ == "__main__":
     main()
