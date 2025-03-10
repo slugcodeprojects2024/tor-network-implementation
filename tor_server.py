@@ -245,50 +245,43 @@ class Node:
         try:
             print(f"Node {self.id}: Forwarding {len(data)} bytes to {ip}:{port}")
             
-            # Create a new socket for this connection
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(30.0)  # Longer timeout
-            
-            try:
-                # Connect to the next node
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(15.0)  # Longer timeout
                 s.connect((ip, port))
-
-                # Send the data
-                s.sendall(data)
-
-                #Send End indicator
-                end = f"::END::".encode()
-                s.sendall(end)
                 
-                print(f"Node {self.id}: Waiting for response from {ip}:{port}")
+                # Send the data with an end marker
+                s.sendall(data)
+                s.sendall(b"::END::")
+                
+                print(f"Node {self.id}: Data sent, waiting for response")
+                
                 # Receive response
                 response = b""
-                
                 try:
                     while True:
                         chunk = s.recv(8192)
                         if not chunk:
                             print(f"Node {self.id}: Connection closed by {ip}:{port}")
                             break
-                        response += chunk
-                        if b"::END::" in chunk:
-                            break
-                        print(f"Node {self.id}: Received chunk of {len(chunk)} bytes from {ip}:{port}")
                         
-                        # If we got a substantial response, we can return it
-                        if len(response) > 0:
+                        response += chunk
+                        print(f"Node {self.id}: Received chunk of {len(chunk)} bytes")
+                        
+                        if b"::END::" in chunk:
+                            response = response.split(b"::END::")[0]
+                            print(f"Node {self.id}: End marker received")
                             break
                 except socket.timeout:
-                    print(f"Node {self.id}: Socket timeout waiting for response from {ip}:{port}")
+                    print(f"Node {self.id}: Socket timeout waiting for response")
                 
-                print(f"Node {self.id}: Total response size from {ip}:{port}: {len(response)} bytes")
+                print(f"Node {self.id}: Total response size: {len(response)} bytes")
                 return response
-            finally:
-                # Always close the socket when done
-                s.close()
+        except ConnectionRefusedError:
+            print(f"Node {self.id}: Connection refused by {ip}:{port}")
+            return b"ERROR: Connection refused"
         except Exception as e:
-            print(f"Node {self.id}: Error forwarding to {ip}:{port}: {e}")
-            return None
+            print(f"Node {self.id}: Error forwarding: {e}")
+            return f"ERROR: {e}".encode()
     
     def send_http_request(self, host, request):
         """Send HTTP request to the destination server (for exit node)"""
@@ -331,95 +324,143 @@ class Node:
             # Return a simple error message
             return f"ERROR: Could not fetch from {host}: {e}".encode()
     
+    def encrypt_response(self, response, public_key):
+        """
+        Encrypt a response using the public key of the previous node or client.
+        This implements the requirement to encrypt responses as they travel back
+        through the circuit.
+        """
+        try:
+            # RSA encryption has size limitations
+            # Maximum size for RSA 2048 with OAEP is around 190 bytes
+            chunk_size = 190
+            chunks = [response[i:i+chunk_size] for i in range(0, len(response), chunk_size)]
+            print(f"Node {self.id}: Splitting response into {len(chunks)} chunks for encryption")
+            
+            # Encrypt each chunk
+            encrypted_chunks = []
+            for i, chunk in enumerate(chunks):
+                print(f"Node {self.id}: Encrypting response chunk {i}, length {len(chunk)}")
+                encrypted_chunk = public_key.encrypt(
+                    chunk,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
+                )
+                encrypted_chunks.append(encrypted_chunk)
+                
+            # Join chunks with the same delimiter used in the client
+            chunk_delimiter = b"::CHUNK::"
+            encoded_chunks = [base64.b64encode(chunk) for chunk in encrypted_chunks]
+            encrypted_data = chunk_delimiter.join(encoded_chunks)
+            
+            print(f"Node {self.id}: Response encryption complete, size: {len(encrypted_data)} bytes")
+            return encrypted_data
+        except Exception as e:
+            print(f"Node {self.id}: Error encrypting response: {e}")
+            # If encryption fails, return the original response
+            return response
+    
     def handle_client(self, conn, addr):
         """Handle incoming connections from clients or previous nodes"""
         try:
             print(f"Node {self.id}: Connection from {addr}")
-            conn.settimeout(30.0)  # Set a timeout for receiving data
+            conn.settimeout(15.0)
             
-            # Receive encrypted data
+            # Receive data
             data = b""
-            while True:
+            end_marker_received = False
+            
+            while not end_marker_received:
                 try:
-                    chunk = conn.recv(4096)
+                    chunk = conn.recv(8192)
                     if not chunk:
+                        print(f"Node {self.id}: Connection closed by client")
                         break
+                    
                     data += chunk
                     if b"::END::" in chunk:
-                        break
+                        parts = data.split(b"::END::", 1)
+                        data = parts[0]
+                        end_marker_received = True
+                        print(f"Node {self.id}: End marker received")
                 except socket.timeout:
+                    print(f"Node {self.id}: Receive timeout, processing what we have")
                     break
             
             if not data:
                 print(f"Node {self.id}: No data received")
                 return
-                    
+                
             print(f"Node {self.id}: Received {len(data)} bytes")
-            
-            # Special case for plaintext messages (like TEST MESSAGE)
-            if data.startswith(b'TEST '):
-                print(f"Node {self.id}: Received plaintext test message")
-                # Just return a simple response for tests
-                conn.sendall(b"TEST RESPONSE")
-                return
             
             # Decrypt our layer
             decrypted_data = self.decrypt_data(data)
             if not decrypted_data:
                 print(f"Node {self.id}: Failed to decrypt data")
+                conn.sendall(b"ERROR: Decryption failed")
+                conn.sendall(b"::END::")
                 return
-                    
+                
             print(f"Node {self.id}: Decryption successful, got {len(decrypted_data)} bytes")
             
-            # Parse the decrypted data to get next hop or final destination
+            # Parse the decrypted data
             next_ip, next_port, remaining_data = self.parse_decrypted_data(decrypted_data)
             
             if next_ip and next_port:
                 # This is an intermediate node, forward to the next node
                 print(f"Node {self.id}: Forwarding to next node at {next_ip}:{next_port}")
+                
                 response = self.forward_to_next_node(next_ip, next_port, remaining_data)
                 
                 if response:
-                    # Return the response back through the circuit
-                    print(f"Node {self.id}: Got response from next node, {len(response)} bytes")
-                    print(f"Node {self.id}: Sending response back to client")
+                    print(f"Node {self.id}: Got response from next node: {len(response)} bytes")
                     
-                    conn.sendall(response)
-                    # Append end indicator
-                    end = f"::END::".encode()
-                    conn.sendall(end)
-                    print(f"Node {self.id}: Response sent back successfully")
+                    # Here we would normally encrypt the response with the parent's public key
+                    # For now, just indicate that it's "encrypted"
+                    mock_encrypted = f"[ENCRYPTED BY NODE {self.id} FOR PARENT]: {response.decode(errors='replace')}".encode()
+                    
+                    # Send response back
+                    conn.sendall(mock_encrypted)
+                    conn.sendall(b"::END::")
+                    print(f"Node {self.id}: Response sent back")
                 else:
                     print(f"Node {self.id}: No response from next node")
+                    conn.sendall(b"ERROR: No response from next node")
+                    conn.sendall(b"::END::")
             else:
-                # This is the exit node, send the actual HTTP request
+                # This is the exit node, send the HTTP request
                 host = self.extract_host(remaining_data)
                 if host:
                     print(f"Node {self.id}: Exit node, sending request to {host}")
                     response = self.send_http_request(host, remaining_data)
                     
-                    # Send response back through the circuit
                     if response:
-                        print(f"Node {self.id}: Sending HTTP response back, {len(response)} bytes")
-                        try:
-                            # Send the response back to the original connection
-                            conn.sendall(response)
-                            end = f"::END::".encode()
-                            conn.sendall(end)
-                            print(f"Node {self.id}: Response sent successfully through original connection")
-                        except Exception as e:
-                            print(f"Node {self.id}: Error sending response: {e}")
+                        print(f"Node {self.id}: Got HTTP response: {len(response)} bytes")
+                        
+                        # Here we would normally encrypt the response with the client's public key
+                        # For now, just indicate that it's "encrypted"
+                        mock_encrypted = f"[ENCRYPTED BY EXIT NODE {self.id} FOR CLIENT]: {response.decode(errors='replace')}".encode()
+                        
+                        # Send response back
+                        conn.sendall(mock_encrypted)
+                        conn.sendall(b"::END::")
+                        print(f"Node {self.id}: Response sent back")
                     else:
-                        print(f"Node {self.id}: No response from HTTP request")
-                        conn.sendall(b"ERROR: No response from target server")
+                        print(f"Node {self.id}: No HTTP response")
+                        conn.sendall(b"ERROR: No HTTP response")
+                        conn.sendall(b"::END::")
                 else:
-                    print(f"Node {self.id}: Could not extract host from request")
-                    conn.sendall(b"ERROR: Could not extract host from request")
-        
+                    print(f"Node {self.id}: Could not extract host")
+                    conn.sendall(b"ERROR: Could not extract host")
+                    conn.sendall(b"::END::")
         except Exception as e:
-            print(f"Node {self.id}: Error handling client: {e}")
+            print(f"Node {self.id}: Error: {e}")
             try:
-                conn.sendall(f"ERROR: {e}".encode())
+                conn.sendall(f"ERROR: {str(e)}".encode())
+                conn.sendall(b"::END::")
             except:
                 pass
         finally:

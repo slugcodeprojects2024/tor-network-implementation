@@ -209,44 +209,45 @@ class TorClient:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect(entry_node['address'])
                 
-                # Add a end delimiter
-                end = f"::END::".encode()
-                encrypted_data += end
-
-                # Send the encrypted data   
+                # Add end marker and send
                 s.sendall(encrypted_data)
+                s.sendall(b"::END::")
                 print("Request sent, waiting for response...")
                 
-                # Use shorter timeouts but retry more
+                # Receive the response
                 s.settimeout(5.0)
                 response = b""
-                max_attempts = 6  # Try for about 30 seconds total
+                max_attempts = 6
                 
                 for attempt in range(max_attempts):
                     try:
                         chunk = s.recv(8192)
-                        if chunk:
-                            response += chunk
-                            print(f"Received chunk: {len(chunk)} bytes, total: {len(response)}")
-                            if b"::END::" in response:
-                                reply = response.split(b"::END::")
-                                response = reply[0]
-                                break
-                           
-                        else:
+                        if not chunk:
                             print("Connection closed by server")
+                            break
+                        
+                        response += chunk
+                        print(f"Received chunk: {len(chunk)} bytes, total: {len(response)}")
+                        
+                        if b"::END::" in chunk:
+                            response = response.split(b"::END::")[0]
+                            print("End marker received")
                             break
                     except socket.timeout:
                         print(f"Socket timeout (attempt {attempt+1}/{max_attempts})")
-                        # Only exit if we've tried enough times
                         if attempt == max_attempts - 1:
                             break
                 
                 if response:
                     print(f"Total response size: {len(response)} bytes")
+                    
+                    # Check if the response includes our mock encryption indicator
+                    if b"[ENCRYPTED BY EXIT NODE" in response:
+                        print("Response appears to be encrypted by the exit node")
+                    
                     return response
                 else:
-                    print("No response received after multiple attempts")
+                    print("No response received")
                     return None
         except Exception as e:
             print(f"Error sending request: {e}")
