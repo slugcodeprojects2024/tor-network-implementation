@@ -166,22 +166,23 @@ class TorClient:
         # First, encrypt with exit node's key
         data = self.encrypt_layer(data, exit_node['public_key'])
         print(f"Encrypted data with exit node's key, size: {len(data)}")
-        
-        # Then add routing and encrypt with entry node's key (Node 0)
-        entry_node = circuit[0]
-        exit_node_ip, exit_node_port = exit_node['address']
-        
-        # Add routing prefix
-        routing_prefix = f"ROUTE:{exit_node_ip}:{exit_node_port}:".encode()
-        print(f"Adding routing to exit node: {exit_node_ip}:{exit_node_port}")
-        
-        # Combine routing prefix with already encrypted data
-        message = routing_prefix + data 
-        
-        # Encrypt with entry node's key
-        data = self.encrypt_layer(message, entry_node['public_key'])
-        print(f"Encrypted with entry node's key, final size: {len(data)}")
-        
+
+        for i in range(len(circuit) - 2, -1 , -1):
+            # Then add routing and encrypt with entry node's key (Node 0)
+            entry_node = circuit[0]
+            exit_node_ip, exit_node_port = exit_node['address']
+            
+            # Add routing prefix
+            routing_prefix = f"ROUTE:{exit_node_ip}:{exit_node_port}:".encode()
+            print(f"Adding routing to exit node: {exit_node_ip}:{exit_node_port}")
+            
+            # Combine routing prefix with already encrypted data
+            message = routing_prefix + data 
+            
+            # Encrypt with entry node's key
+            data = self.encrypt_layer(message, entry_node['public_key'])
+            print(f"Encrypted with entry node's key, final size: {len(data)}")
+            
         return data
     
     def send_request(self, circuit, encrypted_data):
@@ -351,7 +352,7 @@ def main():
     response = tor_client.browse(
         destination_host=DESTINATION_HOST,
         request_path="/get",  # Simple endpoint that returns JSON
-        circuit_length=2,
+        circuit_length=3,
         use_private=True
     )
     
