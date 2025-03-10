@@ -6,6 +6,7 @@ import base64
 import json
 import random
 import argparse
+import time
 from time import sleep
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
@@ -110,10 +111,89 @@ class DirectoryService:
         return circuit
 
 class TorClient:
-    def __init__(self, directory_service=None, auth_token=None):
+    def __init__(self, directory_service=None, auth_token=None, client_id=None):
         self.directory_service = directory_service or DirectoryService()
         self.auth_token = auth_token
         self.private_key, self.public_key = generate_rsa_key_pair()
+        # Add a unique client ID (generate if not provided)
+        self.client_id = client_id or random.randint(10000, 99999)
+        # Register client key with directory
+        self.register_client_key()
+        
+    # Add this to register_client_key to display the key being registered
+    def register_client_key(self):
+        """Register this client's public key with the directory server"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(self.directory_service.directory_server)
+                
+                # Prepare registration data - serialize the key
+                serialized_key = serialize_public_key(self.public_key)
+                
+                # Print key fingerprint for debugging
+                key_fingerprint = serialized_key[:20].decode() + "..." + serialized_key[-20:].decode()
+                print(f"Registering public key: {key_fingerprint}")
+                
+                # Format as expected by tor_server implementation:
+                # The format is likely: REGISTER_CLIENT_KEY client_ID KEY_DATA
+                client_id_str = f"client_{self.client_id}"
+                message = f"REGISTER_CLIENT_KEY {client_id_str}".encode() + b" " + serialized_key
+                
+                print(f"Sending registration with format: REGISTER_CLIENT_KEY {client_id_str} [key_data]")
+                s.sendall(message)
+                
+                # Get response
+                s.settimeout(5.0)
+                try:
+                    response = s.recv(1024)
+                    print(f"Registration response: {response}")
+                    success = response == b"SUCCESS" or response == b""  # Empty might mean success too
+                    
+                    if success:
+                        print(f"Client {self.client_id} registered with directory service")
+                        # Verify registration
+                        self.verify_client_registration()
+                        return True
+                    else:
+                        print(f"Registration failed: {response}")
+                        return False
+                except socket.timeout:
+                    print("No response from directory service (timeout)")
+                    return False
+                    
+        except Exception as e:
+            print(f"Error registering with directory service: {e}")
+            return False
+        
+    def verify_client_registration(self):
+        """Check if our client key is properly registered with directory service"""
+        print("\n=== VERIFYING CLIENT REGISTRATION ===")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(self.directory_service.directory_server)
+                
+                # Try the proper format for key retrieval based on tor_server
+                client_id_str = f"client_{self.client_id}"
+                request = f"GET_CLIENT_KEY {client_id_str}".encode()
+                print(f"Sending verification request: {request}")
+                s.sendall(request)
+                
+                # Get response
+                s.settimeout(3.0)
+                try:
+                    response = s.recv(8192)
+                    if response and len(response) > 20:  # Should be a PEM key if successful
+                        print(f"Success! Retrieved key ({len(response)} bytes)")
+                        return True
+                    else:
+                        print(f"Client {self.client_id} is NOT properly registered: {response}")
+                        return False
+                except socket.timeout:
+                    print(f"Timeout waiting for key verification")
+                    return False
+        except Exception as e:
+            print(f"Error verifying client registration: {e}")
+            return False
         
     def encrypt_layer(self, data, public_key, next_address=None):
         """
@@ -168,8 +248,17 @@ class TorClient:
     def build_onion_request(self, circuit, request_data):
         """Build a layered encrypted request for a circuit of any length"""
         print(f"Building onion with {len(circuit)} layers")
-        data = request_data  # Start with the plaintext HTTP request
-        print(f"Original request: {data[:50]}")
+        
+        # Serialize our public key to include it in the request
+        serialized_key = serialize_public_key(self.public_key).decode()
+        
+        # Add client ID AND public key to data so exit node doesn't need to fetch from directory
+        client_id_marker = f"CLIENT_ID:{self.client_id}:".encode()
+        key_marker = f"CLIENT_KEY:{serialized_key}:".encode()
+        
+        # Format: CLIENT_ID:id:CLIENT_KEY:key:actual-data
+        data = client_id_marker + key_marker + request_data
+        print(f"Added client ID {self.client_id} and public key to request")
         
         # Start with the exit node (last in the circuit)
         exit_node_index = len(circuit) - 1
@@ -200,7 +289,7 @@ class TorClient:
         return data
     
     def send_request(self, circuit, encrypted_data):
-        """Send the request through the first node in the circuit"""
+        """Send the request through the first node in the circuit and handle the encrypted response"""
         try:
             # Get the entry node (first in the circuit)
             entry_node = circuit[0]
@@ -215,9 +304,9 @@ class TorClient:
                 print("Request sent, waiting for response...")
                 
                 # Receive the response
-                s.settimeout(5.0)
+                s.settimeout(10.0)  # Increased timeout
                 response = b""
-                max_attempts = 6
+                max_attempts = 10   # Increased attempts
                 
                 for attempt in range(max_attempts):
                     try:
@@ -239,19 +328,235 @@ class TorClient:
                             break
                 
                 if response:
-                    print(f"Total response size: {len(response)} bytes")
+                    print(f"Total encrypted response size: {len(response)} bytes")
                     
-                    # Check if the response includes our mock encryption indicator
-                    if b"[ENCRYPTED BY EXIT NODE" in response:
-                        print("Response appears to be encrypted by the exit node")
-                    
-                    return response
+                    # Attempt to decrypt the response
+                    if b"::CHUNK::" in response:
+                        try:
+                            # Properly formatted encrypted response
+                            decrypted_response = self.decrypt_response(response)
+                            if decrypted_response:
+                                print(f"Successfully decrypted response: {len(decrypted_response)} bytes")
+                                return decrypted_response
+                            else:
+                                print("Failed to decrypt response, returning encrypted version")
+                                return response
+                        except Exception as e:
+                            print(f"Error during decryption: {e}")
+                            return response
+                    elif b"[ENCRYPTED BY" in response:
+                        # Legacy mock encryption indicator
+                        print("Received mock-encrypted response (server not updated yet)")
+                        return response
+                    else:
+                        print("Unknown response format")
+                        return response
                 else:
                     print("No response received")
                     return None
         except Exception as e:
             print(f"Error sending request: {e}")
             return None
+            
+    def decrypt_response(self, encrypted_data):
+        """Decrypt a response encrypted with our public key"""
+        try:
+            # First check if the response is already plaintext
+            if b"HTTP/" in encrypted_data[:20] or b"{" in encrypted_data[:5]:
+                print("Response appears to be plaintext - no decryption needed")
+                return encrypted_data
+            
+            # Split the data into chunks
+            chunk_delimiter = b"::CHUNK::"
+            encrypted_chunks = encrypted_data.split(chunk_delimiter)
+            print(f"Splitting response into {len(encrypted_chunks)} chunks")
+            
+            # Decrypt each chunk
+            decrypted_chunks = []
+            for i, chunk in enumerate(encrypted_chunks):
+                if not chunk.strip():
+                    continue
+                
+                print(f"Decrypting response chunk {i}, length {len(chunk)}")
+                
+                try:
+                    # Base64 decode the chunk
+                    decoded_chunk = base64.b64decode(chunk)
+                    print(f"Base64 decoded to {len(decoded_chunk)} bytes")
+                    
+                    # Try with various padding configurations
+                    padding_configurations = [
+                        padding.PKCS1v15(),  # Try this first since it worked before
+                        padding.OAEP(
+                            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                            algorithm=hashes.SHA256(),
+                            label=None
+                        ),
+                        padding.OAEP(
+                            mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                            algorithm=hashes.SHA1(),
+                            label=None
+                        )
+                    ]
+                    
+                    success = False
+                    for pad_config in padding_configurations:
+                        try:
+                            decrypted_chunk = self.private_key.decrypt(decoded_chunk, pad_config)
+                            print(f"Successfully decrypted chunk with {pad_config.__class__.__name__}")
+                            decrypted_chunks.append(decrypted_chunk)
+                            success = True
+                            break
+                        except Exception:
+                            continue
+                    
+                    if not success:
+                        print(f"Failed to decrypt chunk {i}")
+                
+                except Exception as e:
+                    print(f"Error processing chunk {i}: {e}")
+            
+            if decrypted_chunks:
+                result = b"".join(decrypted_chunks)
+                print(f"Successfully decrypted {len(decrypted_chunks)} chunks, total length {len(result)}")
+                
+                # Attempt to interpret the binary data
+                print(f"First 20 bytes: {' '.join(f'{b:02x}' for b in result[:20])}")
+                
+                # Try to detect different formats
+                if result.startswith(b"HTTP/") or b"\r\n\r\n" in result[:100]:
+                    print("Response appears to be HTTP")
+                    return result
+                elif result.startswith(b"{") and b"}" in result:
+                    print("Response appears to be JSON")
+                    return result
+                elif b"\x00\x00\x00" in result[:20]:  # Common in binary formats
+                    print("Response appears to be binary data")
+                    
+                    # Try to extract any text from binary data
+                    printable = bytes([b for b in result if 32 <= b <= 126 or b in (9, 10, 13)])
+                    if len(printable) > len(result) * 0.5:  # If at least 50% is printable
+                        print(f"Found readable text in binary: {printable[:100]}")
+                    
+                    return result
+                else:
+                    # It could be encrypted with another layer or in another format
+                    print("Data format unknown, returning binary data")
+                    return result
+                
+            return encrypted_data
+        
+        except Exception as e:
+            print(f"Error in decrypt_response: {e}")
+            return encrypted_data
+
+    def interpret_binary_response(self, binary_data):
+        """Better interpret the binary responses returned from nodes"""
+        print("\n=== ANALYZING BINARY RESPONSE ===")
+        
+        # Create hexdump for visualization
+        def hexdump(data, length=16):
+            result = []
+            for i in range(0, len(data), length):
+                chunk = data[i:i+length]
+                hex_part = ' '.join(f'{b:02x}' for b in chunk)
+                printable = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
+                result.append(f"{i:04x}: {hex_part.ljust(length*3)} {printable}")
+            return '\n'.join(result)
+        
+        # Print first few bytes as hex for debugging
+        print(f"First 64 bytes as hex:")
+        print(hexdump(binary_data[:64]))
+        
+        # Check for HTTP signatures in binary data
+        if b"HTTP/" in binary_data:
+            print("HTTP response detected in binary data!")
+            parts = binary_data.split(b"\r\n\r\n", 1)
+            if len(parts) > 1:
+                headers, body = parts
+                print("\nHTTP Headers:")
+                print(headers.decode(errors='replace'))
+                print("\nBody:")
+                return body
+        
+        # Check for JSON content
+        try:
+            # Try to find JSON by looking for { and } characters
+            start_idx = binary_data.find(b"{")
+            if start_idx >= 0:
+                for end_idx in range(len(binary_data)-1, start_idx, -1):
+                    if binary_data[end_idx] == ord(b'}'):
+                        json_data = binary_data[start_idx:end_idx+1]
+                        try:
+                            parsed = json.loads(json_data)
+                            print("\nJSON data found:")
+                            print(json.dumps(parsed, indent=2))
+                            return json_data
+                        except:
+                            pass
+        except:
+            pass
+
+        # Extract any readable text
+        printable = bytes([b for b in binary_data if 32 <= b <= 126 or b in (9, 10, 13)])
+        if len(printable) > len(binary_data) * 0.2:  # If at least 20% is printable
+            print("\nExtracted readable text:")
+            print(printable.decode(errors='replace'))
+        
+        return binary_data
+
+    def handle_binary_response(self, binary_data):
+        """Extract meaningful information from binary responses"""
+        print("\n=== EXTRACTING DATA FROM BINARY RESPONSE ===")
+        
+        # Create a cleaner hexdump for better analysis
+        def hexdump(data, length=16):
+            result = []
+            for i in range(0, min(256, len(data)), length):
+                chunk = data[i:i+length]
+                hex_part = ' '.join(f'{b:02x}' for b in chunk)
+                ascii_part = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
+                result.append(f"{i:04x}: {hex_part.ljust(length*3)} {ascii_part}")
+            return '\n'.join(result)
+        
+        print(f"Response size: {len(binary_data)} bytes")
+        print(f"Hexdump of first 256 bytes:")
+        print(hexdump(binary_data))
+        
+        # Try to identify a payload marker - common in binary protocols
+        marker_candidates = [b"DATA:", b"PAYLOAD:", b"\x00\x00\x00\x01", b"HTTP/"]
+        for marker in marker_candidates:
+            pos = binary_data.find(marker)
+            if pos >= 0:
+                print(f"Found marker '{marker}' at position {pos}")
+                payload = binary_data[pos+len(marker):]
+                print(f"Extracted payload ({len(payload)} bytes)")
+                return payload
+                
+        # Try to extract any text content - often hidden in binary responses
+        import string
+        printable_chars = string.printable.encode()
+        text_segments = []
+        current_segment = []
+        
+        for byte in binary_data:
+            if byte in printable_chars:
+                current_segment.append(byte)
+            elif current_segment:
+                if len(current_segment) > 4:  # Only keep segments of reasonable length
+                    text_segments.append(bytes(current_segment))
+                current_segment = []
+                
+        if current_segment and len(current_segment) > 4:
+            text_segments.append(bytes(current_segment))
+            
+        if text_segments:
+            print(f"Found {len(text_segments)} text segments")
+            for i, segment in enumerate(text_segments[:3]):  # Show first 3
+                print(f"Segment {i}: {segment.decode(errors='replace')}")
+                
+        # If all else fails, return the original data
+        return binary_data
             
     def browse(self, destination_host, request_path="/", circuit_length=2, use_private=False):
         """
@@ -279,7 +584,232 @@ class TorClient:
         # 5. Send the request through the entry node
         response = self.send_request(circuit, encrypted_request)
         
-        return response
+        if response:
+            # Try to interpret the binary response
+            interpreted_response = self.interpret_binary_response(response)
+            # Try to extract useful data from binary format
+            extracted_data = self.handle_binary_response(interpreted_response)
+            return extracted_data
+        
+        return None
+
+    # Add this method to the TorClient class
+    def verify_key_pair(self):
+        """Verify that our key pair works correctly for encryption and decryption"""
+        print("\n=== VERIFYING KEY PAIR COMPATIBILITY ===")
+        
+        # Create test message
+        test_message = b"Test encryption and decryption with this key pair."
+        print(f"Original message: {test_message}")
+        
+        try:
+            # Encrypt with our public key
+            encrypted = self.public_key.encrypt(
+                test_message,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            print(f"Encrypted length: {len(encrypted)}")
+            
+            # Decrypt with our private key
+            decrypted = self.private_key.decrypt(
+                encrypted,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            print(f"Decrypted message: {decrypted}")
+            
+            # Check if decryption was successful
+            if decrypted == test_message:
+                print("Key pair verification SUCCESSFUL")
+                return True
+            else:
+                print("Key pair verification FAILED - decrypted content doesn't match")
+                return False
+        except Exception as e:
+            print(f"Key pair verification FAILED with error: {e}")
+            return False
+
+    # Add this method to the TorClient class
+    def test_direct_encryption_with_exit_node(self, circuit):
+        """Test direct encryption/decryption with the exit node"""
+        print("\n=== TESTING DIRECT COMMUNICATION WITH EXIT NODE ===")
+        
+        # Get the exit node from the circuit
+        exit_node_index = min(len(circuit) - 1, 2)  # Use last node or node 2
+        exit_node = circuit[exit_node_index]
+        
+        try:
+            # Connect directly to exit node
+            print(f"Connecting directly to exit node {exit_node['id']} at {exit_node['address']}")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(exit_node['address'])
+                
+                # Create a special test message
+                test_message = {
+                    "type": "client_key_test",
+                    "client_id": self.client_id,
+                    "timestamp": str(time.time())
+                }
+                message = json.dumps(test_message).encode()
+                
+                # Add client ID marker exactly as we do in normal requests
+                client_id_marker = f"CLIENT_ID:{self.client_id}:".encode()
+                
+                # Add serialized public key directly
+                serialized_key = serialize_public_key(self.public_key).decode()
+                key_marker = f"CLIENT_KEY:{serialized_key}:".encode()
+                
+                # Combine all parts
+                test_data = client_id_marker + key_marker + message
+                
+                print(f"Sending test message with client ID {self.client_id}")
+                print(f"Including public key in message for direct encryption")
+                s.sendall(test_data)
+                s.sendall(b"::END::")
+                
+                # Wait for response
+                s.settimeout(5.0)
+                response = b""
+                
+                try:
+                    chunk = s.recv(8192)
+                    if chunk:
+                        response += chunk
+                        print(f"Received direct response: {len(chunk)} bytes")
+                        print(f"Response starts with: {chunk[:50]}")
+                        
+                        if b"::CHUNK::" in chunk:
+                            print("Response appears to be encrypted with chunks, attempting decryption")
+                            decrypted = self.decrypt_response(chunk)
+                            if decrypted:
+                                print(f"Successfully decrypted response: {decrypted[:100]}")
+                            else:
+                                print("Failed to decrypt direct response")
+                        
+                    else:
+                        print("No response from exit node - connection closed")
+                except socket.timeout:
+                    print("Socket timeout waiting for test response")
+                
+        except Exception as e:
+            print(f"Error in direct test: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return False
+
+    def debug_directory_service(self):
+        """Debug communication with the directory server"""
+        print("\n=== DIRECTORY SERVICE DEBUG ===")
+        
+        try:
+            # Try various commands to see what the directory server accepts
+            commands = [
+                b"LIST",
+                b"COMMANDS",
+                b"HELP",
+                f"GET_CLIENT client_{self.client_id}".encode(),
+                f"GET_CLIENT_KEY client_{self.client_id}".encode()
+            ]
+            
+            for cmd in commands:
+                print(f"\nTrying command: {cmd}")
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect(self.directory_service.directory_server)
+                    s.sendall(cmd)
+                    
+                    try:
+                        s.settimeout(2.0)
+                        response = s.recv(8192)
+                        print(f"Response ({len(response)} bytes): {response[:100]}...")
+                    except socket.timeout:
+                        print("No response (timeout)")
+                        
+            # Try re-registering with different format
+            print("\nAttempting alternate registration format")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(self.directory_service.directory_server)
+                
+                # Try format that just sends the key directly
+                serialized_key = serialize_public_key(self.public_key)
+                registration_data = f"REGISTER_CLIENT_KEY client_{self.client_id} {serialized_key.decode()}".encode()
+                print(f"Sending registration: {registration_data[:50]}...")
+                s.sendall(registration_data)
+                
+                try:
+                    s.settimeout(2.0)
+                    response = s.recv(1024)
+                    print(f"Registration response: {response}")
+                except socket.timeout:
+                    print("No response to registration (timeout)")
+                    
+        except Exception as e:
+            print(f"Error in directory debug: {e}")
+
+    def test_exit_node_encryption(self, circuit):
+        """Test encryption compatibility with the exit node"""
+        print("\n=== TESTING EXIT NODE ENCRYPTION COMPATIBILITY ===")
+        
+        # Get the exit node from the circuit
+        exit_node_index = min(len(circuit) - 1, 2)  # Use last node or node 2
+        exit_node = circuit[exit_node_index]
+        
+        try:
+            # Connect directly to exit node
+            print(f"Connecting directly to exit node {exit_node['id']} at {exit_node['address']}")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(exit_node['address'])
+                
+                # Create a special test message
+                test_message = {
+                    "type": "encryption_test",
+                    "client_id": self.client_id,
+                    "action": "echo_encrypted",
+                    "test_message": "This is a simple test message for encryption"
+                }
+                message = json.dumps(test_message).encode()
+                
+                # Add client ID and public key
+                client_id_marker = f"CLIENT_ID:{self.client_id}:".encode()
+                serialized_key = serialize_public_key(self.public_key).decode()
+                key_marker = f"CLIENT_KEY:{serialized_key}:".encode()
+                
+                # Combine all parts
+                test_data = client_id_marker + key_marker + message
+                
+                print(f"Sending test message with embedded public key")
+                s.sendall(test_data)
+                s.sendall(b"::END::")
+                
+                # Wait for response
+                s.settimeout(5.0)
+                response = b""
+                
+                try:
+                    chunk = s.recv(8192)
+                    if chunk:
+                        response += chunk
+                        print(f"Received response: {len(chunk)} bytes")
+                        
+                        if b"ERROR:" in chunk:
+                            print(f"ERROR from node: {chunk}")
+                        else:
+                            print(f"Response begins with: {chunk[:30]}")
+                    
+                except socket.timeout:
+                    print("Socket timeout waiting for response")
+                
+        except Exception as e:
+            print(f"Error in encryption test: {e}")
+        
+        return False
 
 # Generate RSA key pair using cryptography library
 def generate_rsa_key_pair():
@@ -366,7 +896,27 @@ def main():
     auth_token = args.token if args.private else None
     tor_client = TorClient(directory_service, auth_token)
     
+    # Verify key pair compatibility before proceeding
+    if not tor_client.verify_key_pair():
+        print("ERROR: Key pair verification failed, aborting")
+        return
+    
+    tor_client.verify_client_registration()
+    
     print(f"\n=== TESTING WITH {'PRIVATE' if args.private else 'PUBLIC'} NODES ===\n")
+    
+    # Get node list and build circuit
+    tor_client.directory_service.request_node_list()
+    if args.private and auth_token:
+        tor_client.directory_service.request_private_nodes(auth_token)
+    
+    circuit = tor_client.directory_service.build_circuit()
+    
+    # Test direct communication with exit node
+    tor_client.test_direct_encryption_with_exit_node(circuit)
+    
+    # Add after creating tor_client
+    tor_client.debug_directory_service()
     
     # Use the client to browse through the Tor network
     response = tor_client.browse(

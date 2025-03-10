@@ -37,6 +37,7 @@ class DirectoryServer:
     def __init__(self, address=('127.0.0.1', 6000)):
         self.address = address
         self.nodes = {}  # {node_id: {'address': addr, 'public_key': key_str, 'is_private': bool}}
+        self.clients = {}  # {client_id: {'public_key': key_str}}
         self.private_key, self.public_key = generate_rsa_key_pair()
         self.auth_tokens = {
             "secret_token_123": {"access_level": "full"},
@@ -60,7 +61,7 @@ class DirectoryServer:
             data = conn.recv(4096)
             message = data.decode()
             
-            if message.startswith("REGISTER"):
+            if message.startswith("REGISTER "):
                 # Handle node registration
                 node_info = json.loads(message[9:])  # Extract JSON after "REGISTER "
                 node_id = node_info['id']
@@ -74,7 +75,54 @@ class DirectoryServer:
                 
                 print(f"Registered node {node_id} at {node_info['address']}")
                 conn.sendall(b"SUCCESS")
+            
+            elif message.startswith("REGISTER_CLIENT "):
+                # Handle client registration
+                try:
+                    client_info = json.loads(message[16:])  # Extract JSON after "REGISTER_CLIENT "
+                    client_id = client_info['id']
+                    
+                    # Store the client information
+                    self.clients[client_id] = {
+                        'public_key': client_info['public_key']  # This is already PEM format string
+                    }
+                    
+                    print(f"Registered client {client_id}")
+                    conn.sendall(b"SUCCESS")
+                except Exception as e:
+                    print(f"Error registering client: {e}")
+                    conn.sendall(b"ERROR")
                 
+            elif message.startswith("GETKEY "):
+                # Handle request for a node's public key
+                try:
+                    node_id = int(message[7:])
+                    if node_id in self.nodes:
+                        # Return the public key for this node
+                        print(f"Sending public key for node {node_id} to {addr}")
+                        conn.sendall(self.nodes[node_id]['public_key'].encode())
+                    else:
+                        print(f"Node {node_id} not found, request from {addr}")
+                        conn.sendall(b"NOTFOUND")
+                except Exception as e:
+                    print(f"Error processing GETKEY request: {e}")
+                    conn.sendall(b"ERROR")
+            
+            elif message.startswith("GETCLIENTKEY "):
+                # Handle request for a client's public key
+                try:
+                    client_id = message[13:]  # Extract client ID after "GETCLIENTKEY "
+                    if client_id in self.clients:
+                        # Return the public key for this client
+                        print(f"Sending public key for client {client_id} to {addr}")
+                        conn.sendall(self.clients[client_id]['public_key'].encode())
+                    else:
+                        print(f"Client {client_id} not found, request from {addr}")
+                        conn.sendall(b"NOTFOUND")
+                except Exception as e:
+                    print(f"Error processing GETCLIENTKEY request: {e}")
+                    conn.sendall(b"ERROR")
+            
             elif message == "LIST":
                 # Return list of public nodes
                 public_nodes = {id: info for id, info in self.nodes.items() 
@@ -112,7 +160,7 @@ class DirectoryServer:
             conn.close()
     
     def save_state(self, filename="directory_state.json"):
-        """Save the current state of registered nodes to a file"""
+        """Save the current state of registered nodes and clients to a file"""
         # Convert node data to serializable format
         serializable_nodes = {}
         for node_id, info in self.nodes.items():
@@ -121,17 +169,25 @@ class DirectoryServer:
                 'public_key': info['public_key'],
                 'is_private': info['is_private']
             }
+        
+        # Convert client data to serializable format
+        serializable_clients = {}
+        for client_id, info in self.clients.items():
+            serializable_clients[client_id] = {
+                'public_key': info['public_key']
+            }
             
         with open(filename, 'w') as f:
             json.dump({
                 'nodes': serializable_nodes,
+                'clients': serializable_clients,
                 'auth_tokens': self.auth_tokens
             }, f)
         
         print(f"Directory state saved to {filename}")
     
     def load_state(self, filename="directory_state.json"):
-        """Load node state from a file"""
+        """Load node and client state from a file"""
         if not os.path.exists(filename):
             print(f"State file {filename} not found")
             return False
@@ -144,11 +200,18 @@ class DirectoryServer:
             self.nodes = {}
             for node_id_str, info in data['nodes'].items():
                 self.nodes[int(node_id_str)] = info
+            
+            # Load clients if present
+            if 'clients' in data:
+                self.clients = {}
+                for client_id, info in data['clients'].items():
+                    self.clients[client_id] = info
                 
             # Load auth tokens
             self.auth_tokens = data['auth_tokens']
             
-            print(f"Loaded {len(self.nodes)} nodes and {len(self.auth_tokens)} auth tokens")
+            client_count = len(self.clients) if hasattr(self, 'clients') else 0
+            print(f"Loaded {len(self.nodes)} nodes, {client_count} clients, and {len(self.auth_tokens)} auth tokens")
             return True
         except Exception as e:
             print(f"Error loading state: {e}")

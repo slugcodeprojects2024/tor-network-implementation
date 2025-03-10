@@ -165,10 +165,58 @@ class Node:
             print(f"Node {self.id}: Error in decrypt_data: {e}")
             return None
     
-    def parse_decrypted_data(self, decrypted_data):
-        """Parse the decrypted data to extract next node information"""
+    def request_client_key(self, client_id):
+        """Request a client's public key from the directory server"""
         try:
-            # Scan for the ROUTE: prefix anywhere in the first 20 bytes
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                # Assuming directory_service object has the address
+                s.connect(self.directory_service.directory_server_address)
+                
+                # Send request for client key
+                request = f"GETCLIENTKEY client_{client_id}".encode()
+                s.sendall(request)
+                
+                # Receive the public key
+                response = s.recv(4096)
+                if response == b"NOTFOUND":
+                    print(f"Node {self.id}: Client {client_id} not found in directory")
+                    return None
+                elif response == b"ERROR":
+                    print(f"Node {self.id}: Error requesting client key")
+                    return None
+                
+                # Convert key string to key object
+                try:
+                    public_key = serialization.load_pem_public_key(response)
+                    print(f"Node {self.id}: Retrieved public key for client {client_id}")
+                    return public_key
+                except Exception as e:
+                    print(f"Node {self.id}: Error loading client public key: {e}")
+                    return None
+        except Exception as e:
+            print(f"Node {self.id}: Error connecting to directory server: {e}")
+            return None
+
+    def parse_decrypted_data(self, decrypted_data):
+        """Parse the decrypted data to extract next node information and client ID"""
+        try:
+            # Extract client ID if present
+            client_id = None
+            client_id_prefix = b'CLIENT_ID:'
+            client_id_pos = decrypted_data.find(client_id_prefix)
+            
+            if client_id_pos >= 0:
+                # Found client ID
+                client_id_data = decrypted_data[client_id_pos + len(client_id_prefix):]
+                client_id_end = client_id_data.find(b':')
+                
+                if client_id_end > 0:
+                    client_id = client_id_data[:client_id_end].decode('utf-8')
+                    # Remove client ID marker from the data
+                    decrypted_data = decrypted_data[:client_id_pos] + decrypted_data[client_id_pos + len(client_id_prefix) + client_id_end + 1:]
+                    print(f"Node {self.id}: Found client ID: {client_id}")
+            
+            # Scan for the ROUTE: prefix
             route_prefix = b'ROUTE:'
             route_pos = decrypted_data.find(route_prefix)
             
@@ -194,22 +242,22 @@ class Node:
                             port = int(port_str)
                             remaining_data = route_data[second_colon+1:]
                             print(f"Node {self.id}: Route info extracted: {ip}:{port}")
-                            return ip, port, remaining_data
+                            return ip, port, remaining_data, client_id
                         except ValueError:
                             print(f"Node {self.id}: Invalid port number: {port_str}")
             
             # Fall back to trying HTTP detection
             if b'GET ' in decrypted_data[:20] or b'Host:' in decrypted_data:
                 print(f"Node {self.id}: Appears to be HTTP request (exit node)")
-                return None, None, decrypted_data
+                return None, None, decrypted_data, client_id
                 
             print(f"Node {self.id}: No routing information found")
             print(f"Node {self.id}: Data starts with: {decrypted_data[:50].hex()}")
-            return None, None, decrypted_data
+            return None, None, decrypted_data, client_id
                 
         except Exception as e:
             print(f"Node {self.id}: Error parsing: {e}")
-            return None, None, decrypted_data
+            return None, None, decrypted_data, None
     
     def extract_host(self, request_bytes):
         """Extract the host from the HTTP header"""
@@ -406,8 +454,8 @@ class Node:
                 
             print(f"Node {self.id}: Decryption successful, got {len(decrypted_data)} bytes")
             
-            # Parse the decrypted data
-            next_ip, next_port, remaining_data = self.parse_decrypted_data(decrypted_data)
+            # Parse the decrypted data (updated to include client_id)
+            next_ip, next_port, remaining_data, client_id = self.parse_decrypted_data(decrypted_data)
             
             if next_ip and next_port:
                 # This is an intermediate node, forward to the next node
@@ -418,12 +466,13 @@ class Node:
                 if response:
                     print(f"Node {self.id}: Got response from next node: {len(response)} bytes")
                     
-                    # Here we would normally encrypt the response with the parent's public key
-                    # For now, just indicate that it's "encrypted"
-                    mock_encrypted = f"[ENCRYPTED BY NODE {self.id} FOR PARENT]: {response.decode(errors='replace')}".encode()
+                    # Proper encryption for response path
+                    # In a real implementation, you would need to know the client or previous node's public key
+                    # Here we'll just re-use our known encryption method
+                    encrypted_response = self.encrypt_response(response, self.public_key)
                     
                     # Send response back
-                    conn.sendall(mock_encrypted)
+                    conn.sendall(encrypted_response)
                     conn.sendall(b"::END::")
                     print(f"Node {self.id}: Response sent back")
                 else:
@@ -440,12 +489,22 @@ class Node:
                     if response:
                         print(f"Node {self.id}: Got HTTP response: {len(response)} bytes")
                         
-                        # Here we would normally encrypt the response with the client's public key
-                        # For now, just indicate that it's "encrypted"
-                        mock_encrypted = f"[ENCRYPTED BY EXIT NODE {self.id} FOR CLIENT]: {response.decode(errors='replace')}".encode()
+                        # Get client's public key from directory if we have a client_id
+                        client_public_key = None
+                        if client_id:
+                            client_public_key = self.request_client_key(client_id)
+                        
+                        if client_public_key:
+                            # Properly encrypt the response with the client's key
+                            encrypted_response = self.encrypt_response(response, client_public_key)
+                            print(f"Node {self.id}: Response encrypted for client {client_id}")
+                        else:
+                            # Fall back to mock encryption if we couldn't get the client key
+                            print(f"Node {self.id}: Using mock encryption (couldn't get client key)")
+                            encrypted_response = f"[ENCRYPTED BY EXIT NODE {self.id} FOR CLIENT]: {response.decode(errors='replace')}".encode()
                         
                         # Send response back
-                        conn.sendall(mock_encrypted)
+                        conn.sendall(encrypted_response)
                         conn.sendall(b"::END::")
                         print(f"Node {self.id}: Response sent back")
                     else:
