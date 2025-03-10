@@ -1,0 +1,33 @@
+
+=== TESTING WITH PUBLIC NODES ===
+
+Received information about 2 nodes
+Created fixed circuit: Node 0 → Node 1 → Node 2
+Built circuit with 2 nodes
+Building onion with 2 layers
+Original request: b'GET /get HTTP/1.1\r\nHost: httpbin.org\r\n\r\n'
+Exit node is Node 1
+Split into 3 chunks for encryption
+Chunk 0 length: 190
+Chunk 1 length: 190
+Chunk 2 length: 121
+Encrypted with exit node's (Node 1) key, size: 1050
+Key: <cryptography.hazmat.bindings._rust.openssl.rsa.RSAPublicKey object at 0x7f302913dc10>
+Adding routing to node 1: 127.0.0.1:5001
+Split into 6 chunks for encryption
+Chunk 0 length: 190
+Chunk 1 length: 190
+Chunk 2 length: 190
+Chunk 3 length: 190
+Chunk 4 length: 190
+Chunk 5 length: 121
+Encrypted with node 0's key, size: 2109
+Connecting to entry node 0 at ('127.0.0.1', 5000)
+Request sent, waiting for response...
+Received chunk: 75 bytes, total: 75
+End marker received
+Total response size: 68 bytes: b"Handle Client ERROR: a bytes-like object is required, not 'NoneType'"
+Client: Splitting into 1 chunks
+Client: Decrypting chunk 0, length 68
+Error decrypting chunk: Incorrect padding
+Client: Failed to decrypt chunk 0

@@ -120,6 +120,7 @@ class TorClient:
         Encrypt a layer of data for the onion routing
         If next_address is provided, it's included in the encrypted data
         """
+
         # Prepare the message
         if next_address:
             # If we have a next address, prepend it to the data
@@ -176,10 +177,12 @@ class TorClient:
         exit_node = circuit[exit_node_index]
         print(f"Exit node is Node {exit_node['id']}")
         
+        key_str = serialize_public_key(self.public_key) 
+        data = key_str + f"::ENDKEY::".encode() + data
         # First, encrypt with exit node's key
         data = self.encrypt_layer(data, exit_node['public_key'])
         print(f"Encrypted with exit node's (Node {exit_node['id']}) key, size: {len(data)}")
-        
+        print(f"Key: {exit_node['public_key']}")
         # For each remaining node, working backward
         for i in range(exit_node_index - 1, -1, -1):
             current_node = circuit[i]
@@ -239,7 +242,7 @@ class TorClient:
                             break
                 
                 if response:
-                    print(f"Total response size: {len(response)} bytes")
+                    print(f"Total response size: {len(response)} bytes: {response}")
                     
                     # Check if the response includes our mock encryption indicator
                     if b"[ENCRYPTED BY EXIT NODE" in response:
@@ -252,7 +255,67 @@ class TorClient:
         except Exception as e:
             print(f"Error sending request: {e}")
             return None
+    
+    def decrypt_chunk(self, encrypted_chunk):
+        """Decrypt a single chunk using this node's private key"""
+        try:
+            # Base64 decode the chunk
+            decoded_chunk = base64.b64decode(encrypted_chunk)
             
+            # Decrypt using private key
+            decrypted_chunk = self.private_key.decrypt(
+                decoded_chunk,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            # copied from nodes, unused in clients
+            # # Ultra-detailed logging of the decrypted content
+            # print(f"Client: Successfully decrypted a chunk, length: {len(decrypted_chunk)}")
+            # print(f"Client: Decrypted chunk hex dump: {decrypted_chunk.hex()[:50]}...")
+            # print(f"Client: As ASCII: {decrypted_chunk[:50]}")
+            
+            # # Look for ROUTE specifically
+            # if b'ROUTE:' in decrypted_chunk:
+            #     route_pos = decrypted_chunk.find(b'ROUTE:')
+            #     print(f"Client: Found ROUTE: at position {route_pos}")
+            #     print(f"Client: Route info: {decrypted_chunk[route_pos:route_pos+30]}")
+            
+            return decrypted_chunk
+        except Exception as e:
+            print(f"Error decrypting chunk: {e}")
+            return None
+    
+    def decrypt_data(self, encrypted_data):
+        """Decrypt multi-chunk data"""
+        try:
+            # Split the data into chunks
+            chunk_delimiter = b"::CHUNK::"
+            encrypted_chunks = encrypted_data.split(chunk_delimiter)
+            print(f"Client: Splitting into {len(encrypted_chunks)} chunks")
+        
+            # Decrypt each chunk
+            decrypted_chunks = []
+            for i, chunk in enumerate(encrypted_chunks):
+                print(f"Client: Decrypting chunk {i}, length {len(chunk)}")
+                decrypted_chunk = self.decrypt_chunk(chunk)
+                if decrypted_chunk:
+                    print(f"Client: Chunk {i} decrypted successfully")
+                    decrypted_chunks.append(decrypted_chunk)
+                else:
+                    print(f"Client: Failed to decrypt chunk {i}")
+                    return None
+            
+            # Join the decrypted chunks
+            result = b"".join(decrypted_chunks)
+            # print(f"Client: All chunks decrypted, total length {len(result)}")
+            return result
+        except Exception as e:
+            print(f"Client : Error in decrypt_data: {e}")
+            return None
+
     def browse(self, destination_host, request_path="/", circuit_length=2, use_private=False):
         """
         Main method to send a request through the Tor network
@@ -278,10 +341,15 @@ class TorClient:
         
         # 5. Send the request through the entry node
         response = self.send_request(circuit, encrypted_request)
-        
-        return response
 
-# Generate RSA key pair using cryptography library
+        # 6. 
+        reply = self.decrypt_data(response)
+        # 7. Remove prepended fields 
+        ind = reply.decode().index("HTTP")
+
+        return response[ind:]
+
+# Generate RSA key pair using cryptography library/
 def generate_rsa_key_pair():
     # Generate a new RSA private key
     private_key = rsa.generate_private_key(
@@ -372,11 +440,12 @@ def main():
     response = tor_client.browse(
         destination_host=DESTINATION_HOST,
         request_path="/get",
-        circuit_length=3,
+        circuit_length=2,
         use_private=args.private
     )
     
     if response:
+        
         print(f"\nResponse received through {'private' if args.private else 'public'} node circuit!")
         print("Response content:")
         print(response.decode(errors='replace'))

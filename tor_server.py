@@ -120,7 +120,7 @@ class Node:
                     label=None
                 )
             )
-            
+
             # Ultra-detailed logging of the decrypted content
             print(f"Node {self.id}: Successfully decrypted a chunk, length: {len(decrypted_chunk)}")
             print(f"Node {self.id}: Decrypted chunk hex dump: {decrypted_chunk.hex()[:50]}...")
@@ -274,6 +274,7 @@ class Node:
                 except socket.timeout:
                     print(f"Node {self.id}: Socket timeout waiting for response")
                 
+
                 print(f"Node {self.id}: Total response size: {len(response)} bytes")
                 return response
         except ConnectionRefusedError:
@@ -330,6 +331,7 @@ class Node:
         This implements the requirement to encrypt responses as they travel back
         through the circuit.
         """
+
         try:
             # RSA encryption has size limitations
             # Maximum size for RSA 2048 with OAEP is around 190 bytes
@@ -371,6 +373,7 @@ class Node:
             
             # Receive data
             data = b""
+            parent_key = b""
             end_marker_received = False
             
             while not end_marker_received:
@@ -381,6 +384,9 @@ class Node:
                         break
                     
                     data += chunk
+                    if b"::ENDKEY::" in chunk:
+                        print(data.decode())
+                        parent_key, data = data.split(b"::ENDKEY::")
                     if b"::END::" in chunk:
                         parts = data.split(b"::END::", 1)
                         data = parts[0]
@@ -418,34 +424,40 @@ class Node:
                 if response:
                     print(f"Node {self.id}: Got response from next node: {len(response)} bytes")
                     
+                    decrypted_response = self.decrypt_data(response)
                     # Here we would normally encrypt the response with the parent's public key
                     # For now, just indicate that it's "encrypted"
-                    mock_encrypted = f"[ENCRYPTED BY NODE {self.id} FOR PARENT]: {response.decode(errors='replace')}".encode()
-                    
-                    # Send response back
-                    conn.sendall(mock_encrypted)
+                    # mock_encrypted = f"[ENCRYPTED BY NODE {self.id} FOR PARENT]: {response.decode(errors='replace')}".encode()
+                    if parent_key != b"":
+                        re_encrypted_response = self.encrypt_response(decrypted_response, parent_key)     
+                        # Send response back
+                        conn.sendall(re_encrypted_response)
+                        conn.sendall(b"::END::")
+                        print(f"Node {self.id}: Response sent back")
+                    conn.sendall(decrypted_response)
                     conn.sendall(b"::END::")
-                    print(f"Node {self.id}: Response sent back")
                 else:
                     print(f"Node {self.id}: No response from next node")
                     conn.sendall(b"ERROR: No response from next node")
                     conn.sendall(b"::END::")
             else:
+                client_key, request = remaining_data.split(b"::ENDKEY::")
                 # This is the exit node, send the HTTP request
-                host = self.extract_host(remaining_data)
+                host = self.extract_host(request)
                 if host:
                     print(f"Node {self.id}: Exit node, sending request to {host}")
-                    response = self.send_http_request(host, remaining_data)
+                    response = self.send_http_request(host, request)
                     
                     if response:
                         print(f"Node {self.id}: Got HTTP response: {len(response)} bytes")
-                        
-                        # Here we would normally encrypt the response with the client's public key
-                        # For now, just indicate that it's "encrypted"
-                        mock_encrypted = f"[ENCRYPTED BY EXIT NODE {self.id} FOR CLIENT]: {response.decode(errors='replace')}".encode()
-                        
+                        client_key_converted = serialization.load_pem_public_key(client_key)
+                        # # Here we would normally encrypt the response with the client's public key
+                        # # For now, just indicate that it's "encrypted"
+                        # mock_encrypted = f"[ENCRYPTED BY EXIT NODE {self.id} FOR CLIENT]: {response.decode(errors='replace')}".encode()
+                        actually_encrypted = self.encrypt_response(response, client_key_converted)
+
                         # Send response back
-                        conn.sendall(mock_encrypted)
+                        conn.sendall(actually_encrypted)
                         conn.sendall(b"::END::")
                         print(f"Node {self.id}: Response sent back")
                     else:
@@ -459,7 +471,7 @@ class Node:
         except Exception as e:
             print(f"Node {self.id}: Error: {e}")
             try:
-                conn.sendall(f"ERROR: {str(e)}".encode())
+                conn.sendall(f"Handle Client ERROR: {str(e)}".encode())
                 conn.sendall(b"::END::")
             except:
                 pass

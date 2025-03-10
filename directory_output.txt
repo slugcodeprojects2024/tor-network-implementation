@@ -1,0 +1,57 @@
+Node 0 successfully registered with directory service
+Node 0 listening on port 5000
+Node 1 successfully registered with directory service
+Node 1 listening on port 5001
+Node 2 successfully registered with directory service
+Node 2 listening on port 5002
+Started 3 nodes
+Node 0: Connection from ('127.0.0.1', 35650)
+Node 0: End marker received
+Node 0: Received 697 bytes
+Node 0: Splitting into 2 chunks
+Node 0: Decrypting chunk 0, length 344
+Node 0: Successfully decrypted a chunk, length: 190
+Node 0: Decrypted chunk hex dump: 524f5554453a3132372e302e302e313a353030313a64544869...
+Node 0: As ASCII: b'ROUTE:127.0.0.1:5001:dTHi4uxalKKNWgMsWruqcvIKknYgW'
+Node 0: Found ROUTE: at position 0
+Node 0: Route info: b'ROUTE:127.0.0.1:5001:dTHi4uxal'
+Node 0: Chunk 0 decrypted successfully
+Node 0: Decrypting chunk 1, length 344
+Node 0: Successfully decrypted a chunk, length: 175
+Node 0: Decrypted chunk hex dump: 4a7a2b583536754472335773336a367142625a51637a667443...
+Node 0: As ASCII: b'Jz+X56uDr3Ws3j6qBbZQczftCMKHGTL68cJS3SviqqUsDLeTBb'
+Node 0: Chunk 1 decrypted successfully
+Node 0: All chunks decrypted, total length 365
+Node 0: Decryption successful, got 365 bytes
+Node 0: Found ROUTE: prefix at position 0
+Node 0: Route info extracted: 127.0.0.1:5001
+Node 0: Forwarding to next node at 127.0.0.1:5001
+Node 0: Forwarding 344 bytes to 127.0.0.1:5001
+Node 1: Connection from ('127.0.0.1', 53914)
+Node 0: Data sent, waiting for response
+Node 1: End marker received
+Node 1: Received 344 bytes
+Node 1: Splitting into 1 chunks
+Node 1: Decrypting chunk 0, length 344
+Node 1: Successfully decrypted a chunk, length: 40
+Node 1: Decrypted chunk hex dump: 474554202f67657420485454502f312e310d0a486f73743a20...
+Node 1: As ASCII: b'GET /get HTTP/1.1\r\nHost: httpbin.org\r\n\r\n'
+Node 1: Chunk 0 decrypted successfully
+Node 1: All chunks decrypted, total length 40
+Node 1: Decryption successful, got 40 bytes
+Node 1: Appears to be HTTP request (exit node)
+Node 1: Extracted host from HTTP request: httpbin.org
+Node 1: Exit node, sending request to httpbin.org
+Node 1: Sending HTTP request to httpbin.org
+Node 1: Request sent to httpbin.org
+Node 1: Received chunk of 430 bytes
+Node 1: Socket timeout after receiving 430 bytes
+Node 1: Total response size: 430 bytes
+Node 1: Got HTTP response: 430 bytes
+Node 1: Response sent back
+Node 0: Received chunk of 476 bytes
+Node 0: End marker received
+Node 0: Total response size: 469 bytes
+Node 0: Got response from next node: 469 bytes
+Node 0: Response sent back
+Shutting down nodes

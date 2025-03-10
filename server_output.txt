@@ -1,0 +1,66 @@
+Node 0 successfully registered with directory service
+Node 0 listening on port 5000
+Node 1 successfully registered with directory service
+Node 1 listening on port 5001
+Node 2 successfully registered with directory service
+Node 2 listening on port 5002
+Started 3 nodes
+Node 0: Connection from ('127.0.0.1', 56892)
+Node 0: End marker received
+Node 0: Received 697 bytes
+Node 0: Splitting into 2 chunks
+Node 0: Decrypting chunk 0, length 344
+Node 0: Successfully decrypted a chunk, length: 190
+Node 0: Decrypted chunk hex dump: 524f5554453a3132372e302e302e313a353030313a63592b37...
+Node 0: As ASCII: b'ROUTE:127.0.0.1:5001:cY+7aqYC21Q4YN+6JFNi/3tJwqacF'
+Node 0: Found ROUTE: at position 0
+Node 0: Route info: b'ROUTE:127.0.0.1:5001:cY+7aqYC2'
+Node 0: Chunk 0 decrypted successfully
+Node 0: Decrypting chunk 1, length 344
+Node 0: Successfully decrypted a chunk, length: 175
+Node 0: Decrypted chunk hex dump: 79633738472b2b4d6d5935636262626b2f677a7072646e4155...
+Node 0: As ASCII: b'yc78G++MmY5cbbbk/gzprdnAUtnAZmwxzlpK8W046vSomAHBzM'
+Node 0: Chunk 1 decrypted successfully
+Node 0: All chunks decrypted, total length 365
+Node 0: Decryption successful, got 365 bytes
+Node 0: Found ROUTE: prefix at position 0
+Node 0: Route info extracted: 127.0.0.1:5001
+Node 0: Forwarding to next node at 127.0.0.1:5001
+Node 0: Forwarding 344 bytes to 127.0.0.1:5001
+Node 0: Data sent, waiting for response
+Node 1: Connection from ('127.0.0.1', 49046)
+Node 1: End marker received
+Node 1: Received 344 bytes
+Node 1: Splitting into 1 chunks
+Node 1: Decrypting chunk 0, length 344
+Node 1: Successfully decrypted a chunk, length: 136
+Node 1: Decrypted chunk hex dump: 3c63727970746f6772617068792e68617a6d61742e62696e64...
+Node 1: As ASCII: b'<cryptography.hazmat.bindings._rust.openssl.rsa.RS'
+Node 1: Chunk 0 decrypted successfully
+Node 1: All chunks decrypted, total length 136
+Node 1: Decryption successful, got 136 bytes
+Node 1: Appears to be HTTP request (exit node)
+Node 1: Extracted host from HTTP request: httpbin.org
+Node 1: Exit node, sending request to httpbin.org
+Node 1: Sending HTTP request to httpbin.org
+Node 1: Request sent to httpbin.org
+Node 1: Received chunk of 230 bytes
+Node 1: Received chunk of 200 bytes
+Node 1: Socket timeout after receiving 430 bytes
+Node 1: Total response size: 430 bytes
+Node 1: Got HTTP response: 430 bytes
+<class 'bytes'>
+Node 1: Splitting response into 3 chunks for encryption
+Node 1: Encrypting response chunk 0, length 190
+Node 1: Error encrypting response: 'bytes' object has no attribute 'encrypt'
+Node 1: Response sent back
+Node 0: Received chunk of 437 bytes
+Node 0: End marker received
+Node 0: Total response size: 430 bytes
+Node 0: Got response from next node: 430 bytes
+Node 0: Splitting into 1 chunks
+Node 0: Decrypting chunk 0, length 430
+Error decrypting chunk: Incorrect padding
+Node 0: Failed to decrypt chunk 0
+Node 0: Error: a bytes-like object is required, not 'NoneType'
+Shutting down nodes
