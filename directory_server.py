@@ -2,8 +2,10 @@ import socket
 import threading
 import json
 import os
+import argparse
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
+from tor_client import TorClient
 
 def generate_rsa_key_pair():
     # Generate a new RSA private key
@@ -216,6 +218,71 @@ class DirectoryServer:
         except Exception as e:
             print(f"Error loading state: {e}")
             return False
+
+    def build_circuit(self, length=3, prefer_private=False):
+        """Build a circuit using all nodes available"""
+        if not self.known_nodes:
+            self.request_node_list()
+            
+        circuit = []
+        
+        # First ensure we have all three nodes in known_nodes
+        # If not, request private nodes if we're in private mode
+        if len(self.known_nodes) < 3 and prefer_private:
+            # Request private nodes with the auth token
+            auth_token = "secret_token_123"  # Default token
+            private_nodes = self.request_private_nodes(auth_token)
+        
+        # Add nodes to the circuit in order (0, 1, 2 for consistency)
+        for node_id in range(3):  # Explicitly request nodes 0, 1, and 2
+            if node_id in self.known_nodes:
+                circuit.append({
+                    'id': node_id,
+                    'address': self.known_nodes[node_id]['address'],
+                    'public_key': self.known_nodes[node_id]['public_key']
+                })
+            else:
+                print(f"Warning: Node {node_id} not found in directory")
+        
+        # If we don't have enough nodes, print a warning
+        if len(circuit) < length:
+            print(f"Warning: Could only build a circuit with {len(circuit)} nodes (requested {length})")
+        else:
+            node_ids = [node['id'] for node in circuit]
+            print(f"Created circuit: Node {node_ids[0]} → Node {node_ids[1]} → Node {node_ids[2]}")
+        
+        return circuit
+
+def main():
+    args = parse_arguments()
+    
+    # Create a directory service
+    directory_service = DirectoryServer()
+    
+    # Create a Tor client with the directory service and optional auth token
+    auth_token = args.token if args.private else None
+    tor_client = TorClient(directory_service, auth_token)
+    
+    print(f"\n=== TESTING WITH {'PRIVATE' if args.private else 'PUBLIC'} NODES ===\n")
+    
+    # Get the list of public nodes
+    directory_service.request_node_list()
+    
+    # If in private mode or force3 mode, request private nodes too
+    if args.private or args.force3:
+        # Always request node 2 (which might be private)
+        directory_service.request_private_nodes(args.token)
+    
+    # Use the client to browse through the Tor network
+    response = tor_client.browse(
+        destination_host=args.host,
+        request_path=args.path,
+        circuit_length=3,  # Always request 3 nodes
+        use_private=args.private
+    )
+    
+    print("\n=== RESPONSE ===\n")
+    print(response)
 
 if __name__ == "__main__":
     # Create and start the directory server
