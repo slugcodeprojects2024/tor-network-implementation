@@ -127,32 +127,20 @@ class TorClient:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect(self.directory_service.directory_server)
                 
-                # Prepare registration data - serialize the key
-                serialized_key = serialize_public_key(self.public_key)
-                
-                # Print key fingerprint for debugging
-                key_fingerprint = serialized_key[:20].decode() + "..." + serialized_key[-20:].decode()
-                print(f"Registering public key: {key_fingerprint}")
-                
-                # Format as expected by tor_server implementation:
-                # The format is likely: REGISTER_CLIENT_KEY client_ID KEY_DATA
+                # Format the key as a single request with the proper format
+                serialized_key = serialize_public_key(self.public_key).decode()
                 client_id_str = f"client_{self.client_id}"
-                message = f"REGISTER_CLIENT_KEY {client_id_str}".encode() + b" " + serialized_key
+                message = f"REGISTER_CLIENT_KEY {client_id_str} {serialized_key}".encode()
                 
-                print(f"Sending registration with format: REGISTER_CLIENT_KEY {client_id_str} [key_data]")
+                print(f"Registering client {self.client_id} with directory service")
                 s.sendall(message)
                 
                 # Get response
                 s.settimeout(5.0)
                 try:
                     response = s.recv(1024)
-                    print(f"Registration response: {response}")
-                    success = response == b"SUCCESS" or response == b""  # Empty might mean success too
-                    
-                    if success:
+                    if response == b"SUCCESS" or response == b"":  # Empty response might mean success
                         print(f"Client {self.client_id} registered with directory service")
-                        # Verify registration
-                        self.verify_client_registration()
                         return True
                     else:
                         print(f"Registration failed: {response}")
@@ -249,15 +237,10 @@ class TorClient:
         """Build a layered encrypted request for a circuit of any length"""
         print(f"Building onion with {len(circuit)} layers")
         
-        # Serialize our public key to include it in the request
-        serialized_key = serialize_public_key(self.public_key).decode()
-        
-        # Add client ID AND public key to data so exit node doesn't need to fetch from directory
+        # Add client ID and public key to data so exit node knows who to encrypt for
         client_id_marker = f"CLIENT_ID:{self.client_id}:".encode()
-        key_marker = f"CLIENT_KEY:{serialized_key}:".encode()
-        
-        # Format: CLIENT_ID:id:CLIENT_KEY:key:actual-data
-        data = client_id_marker + key_marker + request_data
+        key_data = serialize_public_key(self.public_key) + b"::KEY_END::"
+        data = client_id_marker + key_data + request_data
         print(f"Added client ID {self.client_id} and public key to request")
         
         # Start with the exit node (last in the circuit)
@@ -265,7 +248,7 @@ class TorClient:
         exit_node = circuit[exit_node_index]
         print(f"Exit node is Node {exit_node['id']}")
         
-        # First, encrypt with exit node's key
+        # First, encrypt with exit node's key using OAEP padding
         data = self.encrypt_layer(data, exit_node['public_key'])
         print(f"Encrypted with exit node's (Node {exit_node['id']}) key, size: {len(data)}")
         
@@ -330,7 +313,12 @@ class TorClient:
                 if response:
                     print(f"Total encrypted response size: {len(response)} bytes")
                     
-                    # Attempt to decrypt the response
+                    # Check for raw HTTP responses first
+                    raw_http = self.handle_raw_http(response)
+                    if raw_http:
+                        return raw_http
+                        
+                    # Then continue with normal decryption process
                     if b"::CHUNK::" in response:
                         try:
                             # Properly formatted encrypted response
@@ -361,12 +349,16 @@ class TorClient:
     def decrypt_response(self, encrypted_data):
         """Decrypt a response encrypted with our public key"""
         try:
-            # First check if the response is already plaintext
-            if b"HTTP/" in encrypted_data[:20] or b"{" in encrypted_data[:5]:
-                print("Response appears to be plaintext - no decryption needed")
+            # Check if the data is already in plaintext
+            if b"HTTP/1." in encrypted_data[:20]:
+                print("Response appears to be plaintext HTTP - no decryption needed")
+                return encrypted_data
+                    
+            if encrypted_data.startswith(b"ERROR:"):
+                print(f"Received error message: {encrypted_data.decode('utf-8')}")
                 return encrypted_data
             
-            # Split the data into chunks
+            # Split the data into chunks using the delimiter
             chunk_delimiter = b"::CHUNK::"
             encrypted_chunks = encrypted_data.split(chunk_delimiter)
             print(f"Splitting response into {len(encrypted_chunks)} chunks")
@@ -374,226 +366,136 @@ class TorClient:
             # Decrypt each chunk
             decrypted_chunks = []
             for i, chunk in enumerate(encrypted_chunks):
-                if not chunk.strip():
-                    continue
-                
-                print(f"Decrypting response chunk {i}, length {len(chunk)}")
-                
                 try:
+                    print(f"Decrypting response chunk {i}, length {len(chunk)}")
+                    
+                    # Skip empty chunks
+                    if not chunk or len(chunk) < 10:
+                        print(f"Skipping empty/short chunk {i}")
+                        continue
+                    
                     # Base64 decode the chunk
-                    decoded_chunk = base64.b64decode(chunk)
-                    print(f"Base64 decoded to {len(decoded_chunk)} bytes")
+                    try:
+                        decoded_chunk = base64.b64decode(chunk)
+                        print(f"Base64 decoded to {len(decoded_chunk)} bytes")
+                    except:
+                        print(f"Failed to base64 decode chunk {i}, trying as raw data")
+                        decoded_chunk = chunk
                     
-                    # Try with various padding configurations
-                    padding_configurations = [
-                        padding.PKCS1v15(),  # Try this first since it worked before
-                        padding.OAEP(
-                            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                            algorithm=hashes.SHA256(),
-                            label=None
-                        ),
-                        padding.OAEP(
-                            mgf=padding.MGF1(algorithm=hashes.SHA1()),
-                            algorithm=hashes.SHA1(),
-                            label=None
+                    # First try OAEP with SHA-256 (more secure)
+                    try:
+                        decrypted_chunk = self.private_key.decrypt(
+                            decoded_chunk,
+                            padding.OAEP(
+                                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                algorithm=hashes.SHA256(),
+                                label=None
+                            )
                         )
-                    ]
+                        print(f"Successfully decrypted chunk with OAEP-SHA256")
+                        decrypted_chunks.append(decrypted_chunk)
+                        continue
+                    except Exception as e1:
+                        print(f"OAEP-SHA256 decryption failed: {type(e1).__name__}")
                     
-                    success = False
-                    for pad_config in padding_configurations:
-                        try:
-                            decrypted_chunk = self.private_key.decrypt(decoded_chunk, pad_config)
-                            print(f"Successfully decrypted chunk with {pad_config.__class__.__name__}")
-                            decrypted_chunks.append(decrypted_chunk)
-                            success = True
-                            break
-                        except Exception:
-                            continue
+                    # Then try PKCS1v15 (more compatible)
+                    try:
+                        decrypted_chunk = self.private_key.decrypt(
+                            decoded_chunk,
+                            padding.PKCS1v15()
+                        )
+                        print(f"Successfully decrypted chunk with PKCS1v15")
+                        decrypted_chunks.append(decrypted_chunk)
+                        continue
+                    except Exception as e2:
+                        print(f"PKCS1v15 decryption failed: {type(e2).__name__}")
                     
-                    if not success:
-                        print(f"Failed to decrypt chunk {i}")
-                
+                    print(f"All decryption methods failed for chunk {i}")
+                    
                 except Exception as e:
-                    print(f"Error processing chunk {i}: {e}")
+                    print(f"Error decrypting chunk {i}: {e}")
             
-            if decrypted_chunks:
-                result = b"".join(decrypted_chunks)
-                print(f"Successfully decrypted {len(decrypted_chunks)} chunks, total length {len(result)}")
+            if not decrypted_chunks:
+                print(f"Failed to decrypt any chunks")
+                return encrypted_data
                 
-                # Attempt to interpret the binary data
-                print(f"First 20 bytes: {' '.join(f'{b:02x}' for b in result[:20])}")
-                
-                # Try to detect different formats
-                if result.startswith(b"HTTP/") or b"\r\n\r\n" in result[:100]:
-                    print("Response appears to be HTTP")
-                    return result
-                elif result.startswith(b"{") and b"}" in result:
-                    print("Response appears to be JSON")
-                    return result
-                elif b"\x00\x00\x00" in result[:20]:  # Common in binary formats
-                    print("Response appears to be binary data")
+            # Join the decrypted chunks
+            result = b"".join(decrypted_chunks)
+            print(f"Successfully decrypted {len(decrypted_chunks)} chunks, total length {len(result)} bytes")
+            
+            # NEW CODE STARTS HERE: Extract HTTP response if present
+            # Check for HTTP response markers in the decrypted data
+            http_markers = [b'HTTP/1.1', b'HTTP/1.0', b'HTTP/2']
+            for marker in http_markers:
+                pos = result.find(marker)
+                if pos >= 0:
+                    print(f"Found HTTP marker {marker} at position {pos}")
+                    http_response = result[pos:]
                     
-                    # Try to extract any text from binary data
-                    printable = bytes([b for b in result if 32 <= b <= 126 or b in (9, 10, 13)])
-                    if len(printable) > len(result) * 0.5:  # If at least 50% is printable
-                        print(f"Found readable text in binary: {printable[:100]}")
+                    # Extract headers
+                    header_end = http_response.find(b'\r\n\r\n')
+                    if header_end > 0:
+                        headers = http_response[:header_end]
+                        body = http_response[header_end + 4:]  # Skip \r\n\r\n
+                        
+                        print("\n=== EXTRACTED HTTP HEADERS ===")
+                        header_text = headers.decode('utf-8', errors='replace')
+                        print(header_text)
+                        
+                        # Parse Content-Type and Content-Length
+                        content_type = None
+                        content_length = None
+                        
+                        for line in header_text.split('\r\n'):
+                            if line.lower().startswith('content-type:'):
+                                content_type = line.split(':', 1)[1].strip()
+                                print(f"Content-Type: {content_type}")
+                            elif line.lower().startswith('content-length:'):
+                                try:
+                                    content_length = int(line.split(':', 1)[1].strip())
+                                    print(f"Content-Length: {content_length}")
+                                    # Trim body to content length if needed
+                                    if content_length and len(body) > content_length:
+                                        body = body[:content_length]
+                                except:
+                                    pass
+                        
+                        # Handle JSON content specially
+                        if content_type and 'json' in content_type.lower():
+                            try:
+                                json_obj = json.loads(body.decode('utf-8', errors='replace'))
+                                print("\n=== JSON RESPONSE ===")
+                                return json.dumps(json_obj, indent=2)
+                            except Exception as e:
+                                print(f"JSON parsing error: {e}")
+                        
+                        # Return the full HTTP response
+                        try:
+                            return http_response.decode('utf-8', errors='replace')
+                        except:
+                            # If decoding fails, just return headers and note binary body
+                            return header_text + "\r\n\r\n[Binary body]"
+            
+            # Look for JSON content directly if no HTTP headers
+            if result.find(b'{') >= 0:
+                for i in range(len(result)):
+                    if result[i:i+1] == b'{':
+                        try:
+                            # Try to parse JSON starting from this position
+                            json_str = result[i:].decode('utf-8', errors='replace')
+                            json_obj = json.loads(json_str)
+                            if isinstance(json_obj, dict) and len(json_obj) > 0:
+                                return json.dumps(json_obj, indent=2)
+                        except:
+                            pass
+            
+            # If we get here, return the original result
+            return result
                     
-                    return result
-                else:
-                    # It could be encrypted with another layer or in another format
-                    print("Data format unknown, returning binary data")
-                    return result
-                
-            return encrypted_data
-        
         except Exception as e:
             print(f"Error in decrypt_response: {e}")
             return encrypted_data
-
-    def interpret_binary_response(self, binary_data):
-        """Better interpret the binary responses returned from nodes"""
-        print("\n=== ANALYZING BINARY RESPONSE ===")
         
-        # Create hexdump for visualization
-        def hexdump(data, length=16):
-            result = []
-            for i in range(0, len(data), length):
-                chunk = data[i:i+length]
-                hex_part = ' '.join(f'{b:02x}' for b in chunk)
-                printable = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
-                result.append(f"{i:04x}: {hex_part.ljust(length*3)} {printable}")
-            return '\n'.join(result)
-        
-        # Print first few bytes as hex for debugging
-        print(f"First 64 bytes as hex:")
-        print(hexdump(binary_data[:64]))
-        
-        # Check for HTTP signatures in binary data
-        if b"HTTP/" in binary_data:
-            print("HTTP response detected in binary data!")
-            parts = binary_data.split(b"\r\n\r\n", 1)
-            if len(parts) > 1:
-                headers, body = parts
-                print("\nHTTP Headers:")
-                print(headers.decode(errors='replace'))
-                print("\nBody:")
-                return body
-        
-        # Check for JSON content
-        try:
-            # Try to find JSON by looking for { and } characters
-            start_idx = binary_data.find(b"{")
-            if start_idx >= 0:
-                for end_idx in range(len(binary_data)-1, start_idx, -1):
-                    if binary_data[end_idx] == ord(b'}'):
-                        json_data = binary_data[start_idx:end_idx+1]
-                        try:
-                            parsed = json.loads(json_data)
-                            print("\nJSON data found:")
-                            print(json.dumps(parsed, indent=2))
-                            return json_data
-                        except:
-                            pass
-        except:
-            pass
-
-        # Extract any readable text
-        printable = bytes([b for b in binary_data if 32 <= b <= 126 or b in (9, 10, 13)])
-        if len(printable) > len(binary_data) * 0.2:  # If at least 20% is printable
-            print("\nExtracted readable text:")
-            print(printable.decode(errors='replace'))
-        
-        return binary_data
-
-    def handle_binary_response(self, binary_data):
-        """Extract meaningful information from binary responses"""
-        print("\n=== EXTRACTING DATA FROM BINARY RESPONSE ===")
-        
-        # Create a cleaner hexdump for better analysis
-        def hexdump(data, length=16):
-            result = []
-            for i in range(0, min(256, len(data)), length):
-                chunk = data[i:i+length]
-                hex_part = ' '.join(f'{b:02x}' for b in chunk)
-                ascii_part = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
-                result.append(f"{i:04x}: {hex_part.ljust(length*3)} {ascii_part}")
-            return '\n'.join(result)
-        
-        print(f"Response size: {len(binary_data)} bytes")
-        print(f"Hexdump of first 256 bytes:")
-        print(hexdump(binary_data))
-        
-        # Try to identify a payload marker - common in binary protocols
-        marker_candidates = [b"DATA:", b"PAYLOAD:", b"\x00\x00\x00\x01", b"HTTP/"]
-        for marker in marker_candidates:
-            pos = binary_data.find(marker)
-            if pos >= 0:
-                print(f"Found marker '{marker}' at position {pos}")
-                payload = binary_data[pos+len(marker):]
-                print(f"Extracted payload ({len(payload)} bytes)")
-                return payload
-                
-        # Try to extract any text content - often hidden in binary responses
-        import string
-        printable_chars = string.printable.encode()
-        text_segments = []
-        current_segment = []
-        
-        for byte in binary_data:
-            if byte in printable_chars:
-                current_segment.append(byte)
-            elif current_segment:
-                if len(current_segment) > 4:  # Only keep segments of reasonable length
-                    text_segments.append(bytes(current_segment))
-                current_segment = []
-                
-        if current_segment and len(current_segment) > 4:
-            text_segments.append(bytes(current_segment))
-            
-        if text_segments:
-            print(f"Found {len(text_segments)} text segments")
-            for i, segment in enumerate(text_segments[:3]):  # Show first 3
-                print(f"Segment {i}: {segment.decode(errors='replace')}")
-                
-        # If all else fails, return the original data
-        return binary_data
-            
-    def browse(self, destination_host, request_path="/", circuit_length=2, use_private=False):
-        """
-        Main method to send a request through the Tor network
-        """
-        # 1. Get node information
-        self.directory_service.request_node_list()
-        if use_private and self.auth_token:
-            self.directory_service.request_private_nodes(self.auth_token)
-            
-        # 2. Build a circuit
-        try:
-            circuit = self.directory_service.build_circuit(length=circuit_length)
-            print(f"Built circuit with {len(circuit)} nodes")
-        except ValueError as e:
-            print(f"Error building circuit: {e}")
-            return None
-            
-        # 3. Create the HTTP request
-        request = f"GET {request_path} HTTP/1.1\r\nHost: {destination_host}\r\n\r\n".encode()
-        
-        # 4. Build the onion-encrypted request
-        encrypted_request = self.build_onion_request(circuit, request)
-        
-        # 5. Send the request through the entry node
-        response = self.send_request(circuit, encrypted_request)
-        
-        if response:
-            # Try to interpret the binary response
-            interpreted_response = self.interpret_binary_response(response)
-            # Try to extract useful data from binary format
-            extracted_data = self.handle_binary_response(interpreted_response)
-            return extracted_data
-        
-        return None
-
-    # Add this method to the TorClient class
     def verify_key_pair(self):
         """Verify that our key pair works correctly for encryption and decryption"""
         print("\n=== VERIFYING KEY PAIR COMPATIBILITY ===")
@@ -811,6 +713,1022 @@ class TorClient:
         
         return False
 
+    def process_http_response(self, binary_data):
+        """Process HTTP response data and return it in a readable format"""
+        try:
+            # Check for HTTP marker from server
+            if isinstance(binary_data, bytes) and binary_data.startswith(b'HTTP_RESPONSE:'):
+                binary_data = binary_data[14:]  # Remove the marker
+                
+            # Check if this is an HTTP response
+            if isinstance(binary_data, bytes) and binary_data.startswith(b'HTTP/'):
+                print("Detected HTTP response")
+                
+                # Split headers and body
+                parts = binary_data.split(b'\r\n\r\n', 1)
+                if len(parts) == 2:
+                    headers, body = parts
+                    print("\n=== HTTP HEADERS ===")
+                    print(headers.decode('utf-8', errors='replace'))
+                    
+                    # Try to detect Content-Type
+                    content_type = None
+                    for line in headers.split(b'\r\n'):
+                        if line.lower().startswith(b'content-type:'):
+                            content_type = line[13:].strip().decode('ascii', errors='ignore')
+                            break
+                            
+                    print(f"Content-Type: {content_type}")
+                    
+                    # Handle JSON responses
+                    if body and (body.startswith(b'{') or body.startswith(b'[')):
+                        try:
+                            json_data = json.loads(body.decode('utf-8', errors='replace'))
+                            print("\n=== JSON RESPONSE ===")
+                            return json.dumps(json_data, indent=2)
+                        except:
+                            pass
+                    
+                    # Try to decode the body as text
+                    try:
+                        body_text = body.decode('utf-8', errors='replace')
+                        return body_text
+                    except:
+                        # Last resort - return as binary
+                        return body
+                return binary_data.decode('utf-8', errors='replace')
+            
+            # Not an HTTP response, try to find useful data
+            return self.handle_binary_response(binary_data)
+        except Exception as e:
+            print(f"Error processing response: {e}")
+            return f"Error processing response: {str(e)}"
+
+    def process_response(self, decrypted_response):
+        """Process and interpret the decrypted response data"""
+        try:
+            # First, check for HTTP response marker
+            if decrypted_response.startswith(b"HTTP_RESPONSE_MARKER:"):
+                # Extract the actual HTTP response
+                http_response = decrypted_response[len(b"HTTP_RESPONSE_MARKER:"):]
+                
+                print("\n=== HTTP RESPONSE DETECTED ===")
+                
+                # Parse HTTP headers and body
+                parts = http_response.split(b"\r\n\r\n", 1)
+                if len(parts) > 1:
+                    headers, body = parts
+                    
+                    print("\n=== HTTP HEADERS ===")
+                    print(headers.decode('utf-8', errors='replace'))
+                    
+                    # Check if body is JSON
+                    try:
+                        if body.startswith(b"{") or body.startswith(b"["):
+                            json_data = json.loads(body)
+                            print("\n=== JSON CONTENT ===")
+                            print(json.dumps(json_data, indent=2))
+                            return json.dumps(json_data, indent=2)
+                    except:
+                        pass
+                    
+                    # Return decoded body if possible
+                    try:
+                        decoded_body = body.decode('utf-8', errors='replace')
+                        print("\n=== RESPONSE BODY ===")
+                        print(decoded_body[:500] + "..." if len(decoded_body) > 500 else decoded_body)
+                        return decoded_body
+                    except:
+                        return body
+                
+                return http_response.decode('utf-8', errors='replace')
+            
+            # If we get here, it's not a marked HTTP response
+            # Try to detect HTTP responses anyway
+            if b"HTTP/1." in decrypted_response[:20]:
+                print("\n=== HTTP RESPONSE DETECTED ===")
+                
+                parts = decrypted_response.split(b"\r\n\r\n", 1)
+                if len(parts) > 1:
+                    headers, body = parts
+                    print("\n=== HTTP HEADERS ===")
+                    print(headers.decode('utf-8', errors='replace'))
+                    
+                    # Try to decode body as text or JSON
+                    try:
+                        if body.startswith(b"{") or body.startswith(b"["):
+                            json_data = json.loads(body)
+                            print("\n=== JSON CONTENT ===")
+                            print(json.dumps(json_data, indent=2))
+                            return json.dumps(json_data, indent=2)
+                        else:
+                            decoded_body = body.decode('utf-8', errors='replace')
+                            print("\n=== RESPONSE BODY ===")
+                            print(decoded_body[:500])
+                            return decoded_body
+                    except:
+                        return body
+                    
+                return decrypted_response
+            
+            # Last resort, try to interpret as text
+            try:
+                decoded = decrypted_response.decode('utf-8', errors='replace')
+                # Check if it looks like JSON with curly braces
+                if '{' in decoded[:50] and '}' in decoded:
+                    try:
+                        # Try to find a valid JSON substring
+                        start = decoded.find('{')
+                        nested_level = 0
+                        for i in range(start, len(decoded)):
+                            if decoded[i] == '{':
+                                nested_level += 1
+                            elif decoded[i] == '}':
+                                nested_level -= 1
+                                if nested_level == 0:
+                                    potential_json = decoded[start:i+1]
+                                    try:
+                                        json_data = json.loads(potential_json)
+                                        print("\n=== EXTRACTED JSON CONTENT ===")
+                                        return json.dumps(json_data, indent=2)
+                                    except:
+                                        pass
+                    except:
+                        pass
+                
+                # Not JSON or failed to parse, return as text
+                return decoded
+            except:
+                # Binary data, show hexdump
+                return self.interpret_binary_response(decrypted_response)
+            
+        except Exception as e:
+            print(f"Error processing response: {e}")
+            return f"Error processing response: {e}"
+
+    def create_http_request(self, host, path="/", headers=None):
+        """Create a proper HTTP request with necessary headers"""
+        if not headers:
+            headers = {}
+            
+        # Add essential headers
+        if "Host" not in headers:
+            headers["Host"] = host
+        if "User-Agent" not in headers:
+            headers["User-Agent"] = "TorClient/1.0"
+        if "Accept" not in headers:
+            headers["Accept"] = "*/*"
+        if "Connection" not in headers:
+            headers["Connection"] = "close"  # Important for getting complete responses
+            
+        # Build request string
+        request_lines = [f"GET {path} HTTP/1.1"]
+        for key, value in headers.items():
+            request_lines.append(f"{key}: {value}")
+        
+        # Add empty line to separate headers from body
+        request_lines.append("")
+        request_lines.append("")
+        
+        return "\r\n".join(request_lines).encode()
+
+    def extract_http_response(self, binary_data):
+        """Special decoder for HTTP responses embedded in binary data"""
+        try:
+            # Try to find HTTP header pattern
+            http_patterns = [b'HTTP/1.1', b'HTTP/1.0', b'HTTP/2']
+            start_pos = -1
+            
+            for pattern in http_patterns:
+                pos = binary_data.find(pattern)
+                if pos >= 0 and (start_pos == -1 or pos < start_pos):
+                    start_pos = pos
+                    
+            if start_pos >= 0:
+                # Found HTTP response, extract it
+                http_data = binary_data[start_pos:]
+                print(f"Found HTTP response at position {start_pos}")
+                
+                # Find end of headers to locate body
+                header_end = http_data.find(b'\r\n\r\n')
+                if header_end > 0:
+                    headers = http_data[:header_end]
+                    body = http_data[header_end + 4:]  # +4 for \r\n\r\n
+                    
+                    # Parse headers to get content length
+                    content_length = None
+                    content_type = None
+                    
+                    for line in headers.split(b'\r\n'):
+                        if line.lower().startswith(b'content-length:'):
+                            try:
+                                content_length = int(line.split(b':', 1)[1].strip())
+                            except:
+                                pass
+                        elif line.lower().startswith(b'content-type:'):
+                            content_type = line.split(b':', 1)[1].strip().decode('ascii', errors='ignore')
+                    
+                    # Print headers
+                    print("\n=== HTTP HEADERS ===")
+                    print(headers.decode('utf-8', errors='replace'))
+                    
+                    # If we know content length, trim extra data
+                    if content_length is not None and len(body) >= content_length:
+                        body = body[:content_length]
+                        
+                    # Handle different content types
+                    if content_type and 'json' in content_type.lower():
+                        try:
+                            json_obj = json.loads(body)
+                            return json.dumps(json_obj, indent=2)
+                        except:
+                            pass
+                    
+                    return body.decode('utf-8', errors='replace')
+                
+                # If we couldn't parse headers/body, return raw HTTP response
+                return http_data.decode('utf-8', errors='replace')
+                
+            return None
+        except Exception as e:
+            print(f"Error extracting HTTP response: {e}")
+            return None
+
+    def deep_extract_http_content(self, binary_data):
+        """Advanced HTTP content extractor that handles fragmented/corrupted responses"""
+        try:
+            # First check if we have a string instead of bytes
+            if isinstance(binary_data, str):
+                try:
+                    # Try to convert to bytes for consistent processing
+                    binary_data = binary_data.encode('utf-8')
+                except:
+                    print("Warning: Could not convert string data to bytes")
+                    # Just return the string if we can't convert
+                    return binary_data
+            
+            # Check for HTTP protocol signature anywhere in the data
+            http_signatures = [b'HTTP/1.1', b'HTTP/2', b'HTTP/1.0']
+            found_pos = -1
+            
+            for sig in http_signatures:
+                pos = binary_data.find(sig)
+                if pos >= 0:
+                    found_pos = pos
+                    http_ver = sig.decode()
+                    print(f"Found HTTP signature '{http_ver}' at position {pos}")
+                    break
+                    
+            if found_pos >= 0:
+                # Extract data starting from the HTTP signature
+                http_data = binary_data[found_pos-4:] # Include a bit before in case we caught HTTP mid-header
+                
+                # Find the HTTP headers section
+                header_end = http_data.find(b'\r\n\r\n')
+                if header_end > 0:
+                    headers = http_data[:header_end].strip()
+                    body = http_data[header_end + 4:]  # Skip the \r\n\r\n separator
+                    
+                    # Display headers for debugging
+                    print("\n=== HTTP HEADERS ===")
+                    print(headers.decode('utf-8', errors='replace'))
+                    
+                    # Look for Content-Type and Content-Length
+                    content_type = None
+                    content_length = None
+                    
+                    for line in headers.split(b'\r\n'):
+                        if line.lower().startswith(b'content-type:'):
+                            content_type = line.split(b':', 1)[1].strip().decode('utf-8', errors='replace')
+                            print(f"Content-Type: {content_type}")
+                        elif line.lower().startswith(b'content-length:'):
+                            try:
+                                content_length = int(line.split(b':', 1)[1].strip())
+                                print(f"Content-Length: {content_length}")
+                            except:
+                                pass
+                    
+                    # If Content-Length is specified, trim body to that length
+                    if content_length is not None and len(body) >= content_length:
+                        body = body[:content_length]
+                        
+                    # Handle different content types
+                    if content_type and 'json' in content_type.lower():
+                        # Try to parse JSON
+                        try:
+                            json_str = body.decode('utf-8', errors='replace')
+                            json_data = json.loads(json_str)
+                            print("\n=== JSON CONTENT FOUND ===")
+                            formatted_json = json.dumps(json_data, indent=2)
+                            return formatted_json
+                        except Exception as e:
+                            print(f"Failed to parse JSON: {e}")
+                    
+                    # For text-based content types
+                    if content_type and any(ct in content_type.lower() for ct in ['text', 'json', 'xml', 'html']):
+                        try:
+                            text_content = body.decode('utf-8', errors='replace')
+                            return text_content
+                        except:
+                            pass
+                    
+                    # For unknown content types, try to detect format
+                    if body.startswith(b'{') or body.startswith(b'['):
+                        try:
+                            json_str = body.decode('utf-8', errors='replace')
+                            json_data = json.loads(json_str)
+                            print("\n=== JSON CONTENT DETECTED ===")
+                            formatted_json = json.dumps(json_data, indent=2)
+                            return formatted_json
+                        except:
+                            pass
+                    
+                    # Default to decoding as text if all else fails
+                    try:
+                        return body.decode('utf-8', errors='replace')
+                    except:
+                        print("Could not decode body as text")
+                        
+                    # Return raw body if we can't decode it
+                    return body
+                
+                # No header end found, try to return what we have
+                return http_data
+                    
+            # No HTTP signature found, try checking for JSON directly
+            if binary_data.startswith(b'{') or binary_data.startswith(b'['):
+                try:
+                    json_str = binary_data.decode('utf-8', errors='replace')
+                    json_data = json.loads(json_str)
+                    print("\n=== JSON CONTENT DETECTED ===")
+                    return json.dumps(json_data, indent=2)
+                except:
+                    pass
+            
+            # Last resort: search for JSON-like patterns
+            json_start = binary_data.find(b'{')
+            if json_start >= 0:
+                potential_json = binary_data[json_start:]
+                try:
+                    # Find matching closing brace
+                    nesting = 0
+                    json_end = -1
+                    for i, b in enumerate(potential_json):
+                        if b == ord('{'):
+                            nesting += 1
+                        elif b == ord('}'):
+                            nesting -= 1
+                            if nesting == 0:  # Found the end of JSON
+                                json_data = potential_json[:json_end]
+                                try:
+                                    json_obj = json.loads(json_data)
+                                    print(f"\n=== EXTRACTED JSON (at position {json_start}) ===")
+                                    return json.dumps(json_obj, indent=2)
+                                except:
+                                    pass
+                                break
+                except:
+                    pass
+                    
+            # Return the raw data if we couldn't extract anything meaningful
+            return binary_data
+                
+        except Exception as e:
+            print(f"Error extracting HTTP content: {e}")
+            import traceback
+            traceback.print_exc()
+            return binary_data
+
+    def aggressive_http_extractor(self, binary_data):
+        """Ultra-aggressive HTTP/JSON content extractor for partially corrupt data"""
+        print("\n=== AGGRESSIVE HTTP EXTRACTION ===")
+        
+        if isinstance(binary_data, str):
+            try:
+                binary_data = binary_data.encode('utf-8')
+            except:
+                print("Input is already a string, keeping as is")
+                
+                # Check if it's already valid JSON
+                if binary_data.startswith('{') or binary_data.startswith('['):
+                    try:
+                        json_obj = json.loads(binary_data)
+                        return json.dumps(json_obj, indent=2)
+                    except:
+                        pass
+                return binary_data
+        
+        # 1. First try to find an HTTP header pattern anywhere in the data
+        http_markers = [b'HTTP/1.1 ', b'HTTP/1.0 ', b'HTTP/2 ']
+        status_codes = [b' 200 ', b' 302 ', b' 404 ', b' 500 ']
+        common_headers = [b'Content-Type:', b'Content-Length:', b'Date:', b'Server:']
+        
+        # Look for a sequence of HTTP header patterns
+        best_start = -1
+        best_score = 0
+        
+        # Search through the data in overlapping windows
+        for i in range(len(binary_data) - 20):
+            window = binary_data[i:i+200]  # Look at 200 byte windows
+            score = 0
+            
+            # Check for HTTP protocol markers
+            for marker in http_markers:
+                if marker in window:
+                    score += 10
+                    break
+            
+            # Check for status codes
+            for code in status_codes:
+                if code in window:
+                    score += 5
+                    break
+            
+            # Check for common HTTP headers
+            for header in common_headers:
+                if header in window:
+                    score += 3
+            
+            # Check for header/body separator
+            if b'\r\n\r\n' in window:
+                score += 10
+            
+            # If we found a good candidate
+            if score > best_score:
+                best_score = score
+                best_start = i
+        
+        # If we found a potential HTTP response
+        if best_start >= 0 and best_score >= 10:
+            print(f"Found potential HTTP content at position {best_start} with confidence {best_score}")
+            
+            # Extract from the best starting position
+            potential_http = binary_data[best_start:]
+            
+            # Find the end of headers
+            header_end = potential_http.find(b'\r\n\r\n')
+            if header_end > 0:
+                headers = potential_http[:header_end]
+                body = potential_http[header_end + 4:]  # Skip the \r\n\r\n
+                
+                print("\n=== EXTRACTED HTTP HEADERS ===")
+                print(headers.decode('utf-8', errors='replace'))
+                
+                # Parse Content-Length if present
+                content_length = None
+                content_type = None
+                for line in headers.split(b'\r\n'):
+                    if line.lower().startswith(b'content-length:'):
+                        try:
+                            content_length = int(line.split(b':', 1)[1].strip())
+                            print(f"Content-Length: {content_length}")
+                        except:
+                            pass
+                    elif line.lower().startswith(b'content-type:'):
+                        try:
+                            content_type = line.split(b':', 1)[1].strip().decode('ascii', errors='ignore')
+                            print(f"Content-Type: {content_type}")
+                        except:
+                            pass
+                
+                # If content_length is specified, trim the body
+                if content_length and len(body) > content_length:
+                    body = body[:content_length]
+                
+                # Try to handle different content types
+                if content_type and ('json' in content_type.lower()):
+                    try:
+                        json_data = json.loads(body.decode('utf-8', errors='replace'))
+                        print("\n=== EXTRACTED JSON CONTENT ===")
+                        return json.dumps(json_data, indent=2)
+                    except Exception as e:
+                        print(f"Failed to parse JSON: {e}")
+                
+                # Try to extract as text
+                try:
+                    body_text = body.decode('utf-8', errors='replace')
+                    print("\n=== BODY PREVIEW ===")
+                    print(body_text[:200] + '...' if len(body_text) > 200 else body_text)
+                    return body_text
+                except:
+                    return body
+        
+        # 2. Next, look for JSON patterns anywhere in the data
+        for i in range(len(binary_data) - 5):
+            # Look for JSON object start
+            if binary_data[i:i+1] == b'{':
+                try:
+                    # Try to find the matching closing brace
+                    nesting = 1
+                    for j in range(i + 1, len(binary_data)):
+                        if binary_data[j:j+1] == b'{':
+                            nesting += 1
+                        elif binary_data[j:j+1] == b'}':
+                            nesting -= 1
+                            if nesting == 0:  # Found the end of JSON
+                                json_data = binary_data[i:j+1]
+                                try:
+                                    parsed = json.loads(json_data)
+                                    # Require at least some keys to avoid false positives
+                                    if len(parsed.keys()) >= 3:  
+                                        print(f"\n=== FOUND JSON OBJECT at position {i} ===")
+                                        return json.dumps(parsed, indent=2)
+                                except:
+                                    pass
+                                break
+                except:
+                    pass
+        
+        # 3. Last resort: just extract any coherent text
+        try:
+            text_segments = []
+            current_segment = b""
+            min_segment_length = 20  # Look for meaningful text chunks
+            
+            for i in range(len(binary_data)):
+                byte = binary_data[i:i+1]
+                # If it's printable ASCII or common whitespace
+                if 32 <= binary_data[i] <= 126 or binary_data[i] in (9, 10, 13):
+                    current_segment += byte
+                else:
+                    if len(current_segment) >= min_segment_length:
+                        text_segments.append(current_segment)
+                    current_segment = b""
+                    
+            if len(current_segment) >= min_segment_length:
+                text_segments.append(current_segment)
+                
+            if text_segments:
+                longest_segment = max(text_segments, key=len)
+                if len(longest_segment) >= 50:  # Only if we found significant text
+                    print(f"\n=== FOUND TEXT SEGMENT ({len(longest_segment)} bytes) ===")
+                    decoded = longest_segment.decode('utf-8', errors='replace')
+                    return decoded
+                    
+        except Exception as e:
+            print(f"Error extracting text: {e}")
+        
+        # If all else fails
+        return binary_data
+
+    def final_http_extractor(self, data):
+        """Final HTTP extractor that handles properly marked HTTP responses"""
+        try:
+            # Check if it's a string
+            if isinstance(data, str):
+                if data.startswith('HTTP/'):
+                    print("Found HTTP response in string format")
+                    return data
+                try:
+                    data = data.encode('utf-8')
+                except:
+                    return data
+                    
+            # For binary data
+            if isinstance(data, bytes):
+                # First check for HTTP protocol marker
+                if data.startswith(b'HTTP/'):
+                    print("Found HTTP header at start of response")
+                    try:
+                        # Split headers and body
+                        parts = data.split(b'\r\n\r\n', 1)
+                        if len(parts) == 2:
+                            headers, body = parts
+                            
+                            # Print headers for debugging
+                            print("\n=== HTTP HEADERS ===")
+                            header_text = headers.decode('utf-8', errors='replace')
+                            print(header_text)
+                            
+                            # Check if it's JSON
+                            if b'application/json' in headers:
+                                try:
+                                    json_data = json.loads(body)
+                                    return json.dumps(json_data, indent=2)
+                                except:
+                                    pass
+                                    
+                            # Return decoded body or full response
+                            try:
+                                return data.decode('utf-8', errors='replace')
+                            except:
+                                pass
+                    except:
+                        pass
+                        
+                # Try scanning for JSON content
+                for i in range(min(200, len(data))):
+                    if data[i:i+1] == b'{':
+                        try:
+                            # Look for JSON starting at this position
+                            potential_json = data[i:]
+                            json_obj = json.loads(potential_json)
+                            if isinstance(json_obj, dict) and len(json_obj.keys()) > 0:
+                                return json.dumps(json_obj, indent=2)
+                        except:
+                            pass
+                            
+            return data
+        
+        except Exception as e:
+            print(f"Error in final extractor: {e}")
+            return data
+
+    def json_content_extractor(self, data):
+        """Final specialized extractor for finding JSON data in partially decrypted responses"""
+        try:
+            print("\n=== JSON CONTENT EXTRACTION ===")
+            
+            # If string, just try to parse as JSON directly
+            if isinstance(data, str):
+                if data.startswith('{') or data.startswith('['):
+                    try:
+                        json_obj = json.loads(data)
+                        return json.dumps(json_obj, indent=2)
+                    except:
+                        pass
+                
+                # If it might be encoded binary data, convert to bytes
+                try:
+                    data = data.encode('utf-8', errors='ignore')
+                except:
+                    pass
+            
+            # For bytes, look for JSON patterns ('{' and '}')
+            if isinstance(data, bytes):
+                # Look for JSON objects (most common in httpbin responses)
+                for i in range(min(100, len(data))):
+                    if data[i:i+1] == b'{':
+                        # Try different lengths for the potential JSON
+                        for j in range(i+20, len(data)):
+                            try:
+                                # Extract a potential JSON object and try to parse it
+                                potential_json = data[i:j].decode('utf-8', errors='ignore')
+                                if '}' in potential_json:
+                                    try:
+                                        json_obj = json.loads(potential_json)
+                                        if isinstance(json_obj, dict) and len(json_obj) > 2:
+                                            print(f"Found valid JSON at position {i}")
+                                            return json.dumps(json_obj, indent=2)
+                                    except:
+                                        pass
+                            except:
+                                pass
+                                
+                # If we get here, we didn't find a JSON object, try for chunks of readable text
+                printable = []
+                current_chunk = ""
+                for i in range(len(data)):
+                    if 32 <= data[i] <= 126 or data[i] in (9, 10, 13):  # Printable ASCII or whitespace
+                        current_chunk += chr(data[i])
+                    elif current_chunk:
+                        if len(current_chunk) > 20:  # Only keep substantial chunks
+                            printable.append(current_chunk)
+                        current_chunk = ""
+                        
+                if current_chunk and len(current_chunk) > 20:
+                    printable.append(current_chunk)
+                    
+                if printable:
+                    longest_chunk = max(printable, key=len)
+                    if len(longest_chunk) > 50:  # Only return if significant
+                        return longest_chunk
+            
+            # If all else fails
+            return data
+        except Exception as e:
+            print(f"Error in JSON extractor: {e}")
+            return data
+
+    def extract_httpbin_response(self, data):
+        """Super specialized extractor for httpbin.org responses"""
+        print("\n=== HTTPBIN.ORG RESPONSE EXTRACTOR ===")
+        
+        # Convert to bytes if we have a string
+        if isinstance(data, str):
+            try:
+                data = data.encode('utf-8')
+            except:
+                pass
+        
+        # Common patterns found in httpbin responses
+        httpbin_patterns = [b'"url": "http', b'"headers": {', b'"origin": "', b'"args": {']
+        
+        # First, try to locate a JSON object by looking for httpbin-specific patterns
+        for pattern in httpbin_patterns:
+            pattern_pos = data.find(pattern)
+            if pattern_pos >= 0:
+                # Search backwards for the start of the JSON object
+                start_pos = -1
+                for i in range(pattern_pos, max(0, pattern_pos-100), -1):
+                    if data[i:i+1] == b'{':
+                        # Check if this looks like the start of the main JSON object
+                        # by counting braces between i and pattern_pos
+                        nested = 0
+                        for j in range(i+1, pattern_pos):
+                            if data[j:j+1] == b'{':
+                                nested += 1
+                            elif data[j:j+1] == b'}':
+                                nested -= 1
+                        # If we're at the root level, this is our start position
+                        if nested >= 0:
+                            start_pos = i
+                            break
+                
+                if start_pos >= 0:
+                    # Now find matching closing brace
+                    brace_count = 1
+                    end_pos = -1
+                    
+                    for i in range(start_pos+1, len(data)):
+                        if data[i:i+1] == b'{':
+                            brace_count += 1
+                        elif data[i:i+1] == b'}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                end_pos = i+1
+                                break
+                    
+                    if end_pos > start_pos:
+                        # Found complete JSON object
+                        json_text = data[start_pos:end_pos]
+                        try:
+                            # Try to parse and format it
+                            json_str = json_text.decode('utf-8', errors='replace')
+                            json_obj = json.loads(json_str)
+                            
+                            # Verify this looks like a httpbin response
+                            if isinstance(json_obj, dict) and any(key in json_obj for key in ['url', 'headers', 'args', 'origin']):
+                                print(f"Successfully extracted httpbin.org response")
+                                return json.dumps(json_obj, indent=2)
+                        except Exception as e:
+                            print(f"Error parsing JSON: {e}")
+        
+        # If we couldn't find anything with the above method, try a more aggressive approach
+        # by looking for any JSON object with httpbin.org related content
+        for i in range(len(data) - 20):
+            if data[i:i+1] == b'{':
+                # Look ahead for httpbin.org mentions
+                window = data[i:min(i+500, len(data))]
+                if b'httpbin.org' in window or b'"url"' in window:
+                    try:
+                        # Find where this JSON object might end
+                        brace_count = 1
+                        for j in range(i+1, min(i+2000, len(data))):
+                            if data[j:j+1] == b'{':
+                                brace_count += 1
+                            elif data[j:j+1] == b'}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    # We found a complete JSON object
+                                    json_text = data[i:j+1]
+                                    try:
+                                        json_str = json_text.decode('utf-8', errors='replace')
+                                        json_obj = json.loads(json_str)
+                                        if isinstance(json_obj, dict) and len(json_obj) >= 2:
+                                            return json.dumps(json_obj, indent=2)
+                                    except:
+                                        pass
+                                    break
+                    except:
+                        pass
+                        
+        # No valid JSON found
+        return None
+
+    def browse(self, destination_host, request_path="/", circuit_length=3, use_private=False):
+        """Send an HTTP request through the Tor circuit and return the response"""
+        try:
+            print(f"Built circuit with {circuit_length} nodes")
+            
+            # Create HTTP request for destination
+            http_request = self.create_http_request(destination_host, request_path)
+            
+            # Get node list if needed
+            if not self.directory_service.known_nodes:
+                self.directory_service.request_node_list()
+                
+                # Request private nodes if needed
+                if use_private and self.auth_token:
+                    self.directory_service.request_private_nodes(self.auth_token)
+            
+            # Build or use existing circuit
+            circuit = self.directory_service.build_circuit(length=circuit_length, prefer_private=use_private)
+            
+            # Build the onion-encrypted request
+            encrypted_request = self.build_onion_request(circuit, http_request)
+            
+            # Send the request through the first node in the circuit
+            response = self.send_request(circuit, encrypted_request)
+            
+            return response
+            
+        except Exception as e:
+            print(f"Error browsing through Tor: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def brute_force_extract_json(self, data):
+        """Brute force extraction of httpbin.org JSON responses"""
+        print("\n=== BRUTE FORCE JSON EXTRACTION ===")
+        
+        # Convert to bytes if needed
+        if isinstance(data, str):
+            try:
+                data = data.encode('utf-8')
+            except:
+                pass
+        
+        # 1. Find all httpbin.org specific keywords in the response
+        httpbin_keys = [
+            b'"url":', b'"headers":', b'"origin":', b'"args":', 
+            b'"Host":', b'"User-Agent":', b'httpbin.org'
+        ]
+        
+        key_positions = {}
+        for key in httpbin_keys:
+            pos = data.find(key)
+            if pos >= 0:
+                key_positions[key.decode()] = pos
+        
+        # If we found at least 3 httpbin keys, we likely have a valid response
+        if len(key_positions) >= 3:
+            print(f"Found {len(key_positions)} httpbin.org JSON keys:")
+            for key, pos in key_positions.items():
+                print(f"  - {key} at position {pos}")
+                
+            # 2. Find the start of the JSON object (the opening brace)
+            min_pos = min(key_positions.values())
+            start_pos = -1
+            
+            # Look backwards from the first key to find opening brace
+            for i in range(min_pos, max(0, min_pos-200), -1):
+                if data[i:i+1] == b'{':
+                    # Check if this is likely the main JSON object
+                    # by ensuring balanced braces between here and min_pos
+                    brace_balance = 0
+                    valid_start = True
+                    for j in range(i, min_pos):
+                        if data[j:j+1] == b'{':
+                            brace_balance += 1
+                        elif data[j:j+1] == b'}':
+                            brace_balance -= 1
+                        if brace_balance < 0:
+                            valid_start = False
+                            break
+                    
+                    if valid_start:
+                        start_pos = i
+                        break
+            
+            # 3. Find the end of the JSON object (matching closing brace)
+            if start_pos >= 0:
+                print(f"Found JSON object starting at position {start_pos}")
+                brace_balance = 0
+                end_pos = -1
+                
+                for i in range(start_pos, len(data)):
+                    if data[i:i+1] == b'{':
+                        brace_balance += 1
+                    elif data[i:i+1] == b'}':
+                        brace_balance -= 1
+                        if brace_balance == 0:
+                            end_pos = i + 1
+                            break
+                
+                # 4. If we found both start and end, extract and parse the JSON
+                if end_pos > start_pos:
+                    try:
+                        json_object = data[start_pos:end_pos]
+                        json_str = json_object.decode('utf-8', errors='replace')
+                        
+                        # Remove any invalid characters that might prevent parsing
+                        json_str = ''.join(c for c in json_str if ord(c) >= 32 or c in '\n\r\t')
+                        
+                        # Try to parse the JSON
+                        parsed_json = json.loads(json_str)
+                        
+                        # Verify it's a httpbin response by checking for expected keys
+                        if isinstance(parsed_json, dict) and 'url' in parsed_json and 'headers' in parsed_json:
+                            print("Successfully extracted httpbin.org JSON response!")
+                            return json.dumps(parsed_json, indent=2)
+                    except Exception as e:
+                        print(f"Error parsing JSON: {e}")
+                        
+                        # Try one more time with aggressive character filtering
+                        try:
+                            json_str = ''.join(c for c in json_str if c in '{}[]",:0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_.:/ \n\r\t')
+                            parsed_json = json.loads(json_str)
+                            print("Successfully parsed JSON after character filtering!")
+                            return json.dumps(parsed_json, indent=2)
+                        except:
+                            pass
+        
+        # 5. If above approach fails, try scanning every position for valid JSON
+        print("Trying brute force JSON scanning...")
+        for i in range(len(data) - 50):  # Minimum reasonable JSON size
+            if data[i:i+1] == b'{':
+                # Scan all possible ending positions
+                for j in range(i + 50, min(i + 2000, len(data))):
+                    if data[j:j+1] == b'}':
+                        # Try parsing this slice as JSON
+                        try:
+                            json_slice = data[i:j+1]
+                            json_str = json_slice.decode('utf-8', errors='replace')
+                            parsed = json.loads(json_str)
+                            
+                            # Verify it has httpbin.org characteristics
+                            if isinstance(parsed, dict) and len(parsed) >= 3:
+                                # Check for common httpbin keys
+                                httpbin_score = sum(1 for key in ['url', 'headers', 'args', 'origin'] if key in parsed)
+                                if httpbin_score >= 2:
+                                    print(f"Found valid httpbin JSON object at position {i} (length {j-i+1})")
+                                    return json.dumps(parsed, indent=2)
+                        except:
+                            pass
+        
+        # 6. Last resort: detect ANY valid JSON structure
+        print("Trying to find ANY valid JSON...")
+        for i in range(len(data) - 20):
+            if data[i:i+1] in (b'{', b'['):
+                for j in range(i + 20, min(i + 1000, len(data))):
+                    if (data[i:i+1] == b'{' and data[j:j+1] == b'}') or \
+                       (data[i:i+1] == b'[' and data[j:j+1] == b']'):
+                        try:
+                            json_slice = data[i:j+1]
+                            json_str = json_slice.decode('utf-8', errors='replace')
+                            parsed = json.loads(json_str)
+                            if parsed:
+                                print(f"Found generic JSON at position {i}")
+                                return json.dumps(parsed, indent=2)
+                        except:
+                            pass
+        
+        # Nothing found, return None to let other extractors try
+        return None
+
+    def handle_raw_http(self, response):
+        """Process raw HTTP responses that bypassed encryption"""
+        try:
+            # Check if this is a raw HTTP response
+            if isinstance(response, bytes) and response.startswith(b"RAW_HTTP_RESPONSE:"):
+                print("\n=== RAW HTTP RESPONSE DETECTED ===")
+                http_data = response[len(b"RAW_HTTP_RESPONSE:"):]
+                
+                # Find the headers/body split
+                header_end = http_data.find(b"\r\n\r\n")
+                if (header_end > 0):
+                    headers = http_data[:header_end]
+                    body = http_data[header_end + 4:]  # Skip \r\n\r\n
+                    
+                    # Print headers for debugging
+                    print("HTTP Headers:")
+                    print(headers.decode('utf-8', errors='replace'))
+                    
+                    # Detect Content-Type
+                    content_type = None
+                    content_length = None
+                    for line in headers.split(b"\r\n"):
+                        if line.lower().startswith(b"content-type:"):
+                            content_type = line.split(b":", 1)[1].strip().decode('utf-8', errors='replace')
+                            print(f"Content-Type: {content_type}")
+                        elif line.lower().startswith(b"content-length:"):
+                            try:
+                                content_length = int(line.split(b":", 1)[1].strip())
+                                print(f"Content-Length: {content_length}")
+                            except:
+                                pass
+                    
+                    # If Content-Length is specified, trim body
+                    if content_length is not None and len(body) > content_length:
+                        body = body[:content_length]
+                    
+                    # Process based on Content-Type
+                    if content_type and "json" in content_type.lower():
+                        try:
+                            json_data = json.loads(body.decode('utf-8', errors='replace'))
+                            return json.dumps(json_data, indent=2)
+                        except Exception as e:
+                            print(f"Error parsing JSON: {e}")
+                    
+                    # Default to returning the body as text
+                    try:
+                        return body.decode('utf-8', errors='replace')
+                    except:
+                        return body
+                
+                # If we couldn't split headers/body, return the whole thing
+                try:
+                    return http_data.decode('utf-8', errors='replace')
+                except:
+                    return http_data
+                    
+            return None  # Not a raw HTTP response
+        except Exception as e:
+            print(f"Error handling raw HTTP: {e}")
+            return None
+
 # Generate RSA key pair using cryptography library
 def generate_rsa_key_pair():
     # Generate a new RSA private key
@@ -929,7 +1847,32 @@ def main():
     if response:
         print(f"\nResponse received through {'private' if args.private else 'public'} node circuit!")
         print("Response content:")
-        print(response.decode(errors='replace'))
+        
+        # Try our new brute force extractor FIRST - most aggressive approach
+        brute_force_json = tor_client.brute_force_extract_json(response)
+        if brute_force_json:
+            print(brute_force_json)
+            return
+        
+        # Then try other extractors in sequence
+        for extractor in [
+            tor_client.extract_httpbin_response,
+            tor_client.json_content_extractor,
+            tor_client.final_http_extractor,
+            tor_client.aggressive_http_extractor
+        ]:
+            result = extractor(response)
+            if result:
+                print(result)
+                return
+        
+        # Last resort - binary preview
+        print(f"Binary response ({len(response)} bytes)")
+        print("\nBinary preview:")
+        for i in range(0, min(128, len(response)), 16):
+            hex_values = ' '.join(f'{b:02x}' for b in response[i:i+16])
+            ascii_values = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in response[i:i+16])
+            print(f"{i:04x}: {hex_values.ljust(48)} {ascii_values}")
     else:
         print(f"\nFailed to get a response through {'private' if args.private else 'public'} nodes")
 

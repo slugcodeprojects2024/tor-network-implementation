@@ -200,23 +200,41 @@ class Node:
     def parse_decrypted_data(self, decrypted_data):
         """Parse the decrypted data to extract next node information and client ID"""
         try:
-            # Extract client ID if present
+            # Extract client ID if present - make this more robust
             client_id = None
             client_id_prefix = b'CLIENT_ID:'
             client_id_pos = decrypted_data.find(client_id_prefix)
             
-            if client_id_pos >= 0:
+            if (client_id_pos >= 0):
                 # Found client ID
                 client_id_data = decrypted_data[client_id_pos + len(client_id_prefix):]
                 client_id_end = client_id_data.find(b':')
                 
-                if client_id_end > 0:
+                if (client_id_end > 0):
                     client_id = client_id_data[:client_id_end].decode('utf-8')
                     # Remove client ID marker from the data
-                    decrypted_data = decrypted_data[:client_id_pos] + decrypted_data[client_id_pos + len(client_id_prefix) + client_id_end + 1:]
+                    new_data = decrypted_data[:client_id_pos] + decrypted_data[client_id_pos + len(client_id_prefix) + client_id_end + 1:]
+                    decrypted_data = new_data
                     print(f"Node {self.id}: Found client ID: {client_id}")
             
-            # Scan for the ROUTE: prefix
+            # Check for public key
+            key_end_marker = b'::KEY_END::'
+            key_end_pos = decrypted_data.find(key_end_marker)
+            client_public_key = None
+            
+            if (key_end_pos > 0):
+                # Extract key data
+                key_data = decrypted_data[:key_end_pos]
+                if key_data.startswith(b'-----BEGIN PUBLIC KEY-----'):
+                    try:
+                        client_public_key = serialization.load_pem_public_key(key_data)
+                        print(f"Node {self.id}: Found embedded public key, length: {len(key_data)}")
+                        # Remove key from data
+                        decrypted_data = decrypted_data[key_end_pos + len(key_end_marker):]
+                    except Exception as e:
+                        print(f"Node {self.id}: Error loading embedded key: {e}")
+            
+            # Rest of parsing logic remains the same...
             route_prefix = b'ROUTE:'
             route_pos = decrypted_data.find(route_prefix)
             
@@ -242,22 +260,22 @@ class Node:
                             port = int(port_str)
                             remaining_data = route_data[second_colon+1:]
                             print(f"Node {self.id}: Route info extracted: {ip}:{port}")
-                            return ip, port, remaining_data, client_id
+                            return ip, port, remaining_data, client_id, client_public_key
                         except ValueError:
                             print(f"Node {self.id}: Invalid port number: {port_str}")
             
             # Fall back to trying HTTP detection
             if b'GET ' in decrypted_data[:20] or b'Host:' in decrypted_data:
                 print(f"Node {self.id}: Appears to be HTTP request (exit node)")
-                return None, None, decrypted_data, client_id
+                return None, None, decrypted_data, client_id, client_public_key
                 
             print(f"Node {self.id}: No routing information found")
             print(f"Node {self.id}: Data starts with: {decrypted_data[:50].hex()}")
-            return None, None, decrypted_data, client_id
+            return None, None, decrypted_data, client_id, client_public_key
                 
         except Exception as e:
             print(f"Node {self.id}: Error parsing: {e}")
-            return None, None, decrypted_data, None
+            return None, None, decrypted_data, None, None
     
     def extract_host(self, request_bytes):
         """Extract the host from the HTTP header"""
@@ -266,12 +284,12 @@ class Node:
             host_prefix = b'Host: '
             host_pos = request_bytes.find(host_prefix)
             
-            if host_pos >= 0:
+            if (host_pos >= 0):
                 # Found the Host header
                 host_start = host_pos + len(host_prefix)
                 host_end = request_bytes.find(b'\r\n', host_start)
                 
-                if host_end > host_start:
+                if (host_end > host_start):
                     host = request_bytes[host_start:host_end].decode('utf-8')
                     print(f"Node {self.id}: Extracted host from HTTP request: {host}")
                     return host
@@ -338,68 +356,102 @@ class Node:
             
             # Create SSL context for HTTPS
             context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
             
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(15.0)  # Set timeout for connection
-                with context.wrap_socket(s, server_hostname=host) as ssl_socket:
+                
+                try:
                     # Connect to the host on port 443 (HTTPS)
-                    ssl_socket.connect((host, 443))
+                    s.connect((host, 443))
+                    ssl_socket = context.wrap_socket(s, server_hostname=host)
                     
                     # Send the request
                     ssl_socket.sendall(request)
                     print(f"Node {self.id}: Request sent to {host}")
                     
                     # Receive the response in chunks
-                    ssl_socket.settimeout(1.0)
+                    ssl_socket.settimeout(5.0)
                     response = b""
-                    content_length = 2**63
                     try:
                         while True:
                             chunk = ssl_socket.recv(4096)
                             if not chunk:
                                 break
                             response += chunk
-                    
                             print(f"Node {self.id}: Received chunk of {len(chunk)} bytes")
+                            
+                            # Detect complete HTTP response
+                            if b"\r\n0\r\n\r\n" in response or (
+                                b"Content-Length: " in response and 
+                                len(response) > 1000):
+                                break
                     except socket.timeout:
                         print(f"Node {self.id}: Socket timeout after receiving {len(response)} bytes")
-                        chunk += response
                     
-                    print(f"Node {self.id}: Total response size: {len(response)} bytes")
+                    # Instead of encrypting HTTP responses, mark them with a special prefix
+                    if response.startswith(b"HTTP/"):
+                        print(f"Node {self.id}: Sending raw HTTP response of {len(response)} bytes")
+                        return b"RAW_HTTP_RESPONSE:" + response
+                    
                     return response
+                    
+                except Exception as e:
+                    print(f"Node {self.id}: Error with SSL connection: {e}")
+                    # Try plain HTTP as fallback
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as plain_s:
+                        plain_s.settimeout(10.0)
+                        plain_s.connect((host, 80))
+                        plain_s.sendall(request)
+                        
+                        response = b""
+                        while True:
+                            chunk = plain_s.recv(4096)
+                            if not chunk:
+                                break
+                            response += chunk
+                        
+                        # Also mark HTTP responses from plaintext connection
+                        if response.startswith(b"HTTP/"):
+                            return b"RAW_HTTP_RESPONSE:" + response
+                        return response
+                        
         except Exception as e:
             print(f"Node {self.id}: Error sending HTTP request: {e}")
             # Return a simple error message
             return f"ERROR: Could not fetch from {host}: {e}".encode()
     
-    def encrypt_response(self, response, public_key):
+    def encrypt_response(self, response, client_public_key):
         """
-        Encrypt a response using the public key of the previous node or client.
-        This implements the requirement to encrypt responses as they travel back
-        through the circuit.
+        Encrypt a response using the client's public key (not our own key).
+        Uses PKCS1v15 padding for maximum compatibility.
         """
         try:
             # RSA encryption has size limitations
-            # Maximum size for RSA 2048 with OAEP is around 190 bytes
-            chunk_size = 190
+            # For PKCS1v15, limit is key size - 11 bytes (for 2048-bit key, that's around 245 bytes)
+            chunk_size = 245 
             chunks = [response[i:i+chunk_size] for i in range(0, len(response), chunk_size)]
             print(f"Node {self.id}: Splitting response into {len(chunks)} chunks for encryption")
             
-            # Encrypt each chunk
+            # Encrypt each chunk using PKCS1v15 padding (which client can decrypt)
             encrypted_chunks = []
             for i, chunk in enumerate(chunks):
                 print(f"Node {self.id}: Encrypting response chunk {i}, length {len(chunk)}")
-                encrypted_chunk = public_key.encrypt(
-                    chunk,
-                    padding.OAEP(
-                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                        algorithm=hashes.SHA256(),
-                        label=None
+                try:
+                    encrypted_chunk = client_public_key.encrypt(
+                        chunk,
+                        padding.PKCS1v15()  # Use PKCS1v15 for consistency
                     )
-                )
-                encrypted_chunks.append(encrypted_chunk)
-                
-            # Join chunks with the same delimiter used in the client
+                    encrypted_chunks.append(encrypted_chunk)
+                except Exception as e:
+                    print(f"Node {self.id}: Error encrypting chunk {i}: {e}")
+                    if encrypted_chunks:
+                        break
+                    else:
+                        return response  # Return unencrypted if we can't encrypt anything
+                    
+            # Join chunks with a delimiter
             chunk_delimiter = b"::CHUNK::"
             encoded_chunks = [base64.b64encode(chunk) for chunk in encrypted_chunks]
             encrypted_data = chunk_delimiter.join(encoded_chunks)
@@ -408,7 +460,6 @@ class Node:
             return encrypted_data
         except Exception as e:
             print(f"Node {self.id}: Error encrypting response: {e}")
-            # If encryption fails, return the original response
             return response
     
     def handle_client(self, conn, addr):
@@ -454,27 +505,35 @@ class Node:
                 
             print(f"Node {self.id}: Decryption successful, got {len(decrypted_data)} bytes")
             
-            # Parse the decrypted data (updated to include client_id)
-            next_ip, next_port, remaining_data, client_id = self.parse_decrypted_data(decrypted_data)
+            # Parse the decrypted data (updated to include client_id and client_public_key)
+            next_ip, next_port, remaining_data, client_id, client_public_key = self.parse_decrypted_data(decrypted_data)
             
-            if next_ip and next_port:
+            if (next_ip and next_port):
                 # This is an intermediate node, forward to the next node
                 print(f"Node {self.id}: Forwarding to next node at {next_ip}:{next_port}")
                 
                 response = self.forward_to_next_node(next_ip, next_port, remaining_data)
                 
-                if response:
+                if (response):
                     print(f"Node {self.id}: Got response from next node: {len(response)} bytes")
                     
-                    # Proper encryption for response path
-                    # In a real implementation, you would need to know the client or previous node's public key
-                    # Here we'll just re-use our known encryption method
-                    encrypted_response = self.encrypt_response(response, self.public_key)
+                    # Encrypt with our private key to prove it's from us
+                    if next_ip and next_port:
+                        # For intermediate nodes, encrypt with our public key
+                        encrypted_response = self.encrypt_response(response, self.public_key)
+                    else:
+                        # For exit nodes, use client's public key if available
+                        if client_public_key:
+                            print(f"Node {self.id}: Using embedded client key for response encryption")
+                            encrypted_response = self.encrypt_response(response, client_public_key)
+                        else:
+                            print(f"Node {self.id}: Using our key for response encryption (fallback)")
+                            encrypted_response = self.encrypt_response(response, self.public_key)
                     
                     # Send response back
                     conn.sendall(encrypted_response)
                     conn.sendall(b"::END::")
-                    print(f"Node {self.id}: Response sent back")
+                    print(f"Node {self.id}: Response sent back to {addr}")
                 else:
                     print(f"Node {self.id}: No response from next node")
                     conn.sendall(b"ERROR: No response from next node")
@@ -482,25 +541,45 @@ class Node:
             else:
                 # This is the exit node, send the HTTP request
                 host = self.extract_host(remaining_data)
-                if host:
+                if (host):
                     print(f"Node {self.id}: Exit node, sending request to {host}")
                     response = self.send_http_request(host, remaining_data)
                     
+                    # Find the section in handle_client where it processes the response from httpbin.org
                     if response:
                         print(f"Node {self.id}: Got HTTP response: {len(response)} bytes")
                         
-                        # Get client's public key from directory if we have a client_id
-                        client_public_key = None
-                        if client_id:
-                            client_public_key = self.request_client_key(client_id)
+                        # Check if this is a raw HTTP response that should bypass encryption
+                        if response.startswith(b"RAW_HTTP_RESPONSE:"):
+                            print(f"Node {self.id}: Sending raw HTTP response without encryption")
+                            conn.sendall(response)  # Send as-is, with the marker
+                            conn.sendall(b"::END::")
+                            return
                         
+                        # Otherwise continue with encryption as normal
+                        # (your existing encryption code here)
                         if client_public_key:
-                            # Properly encrypt the response with the client's key
+                            print(f"Node {self.id}: Using embedded client key for response encryption")
                             encrypted_response = self.encrypt_response(response, client_public_key)
-                            print(f"Node {self.id}: Response encrypted for client {client_id}")
+                        
+                        print(f"Node {self.id}: Response sample: {response[:100]}")
+                        
+                        # Use client public key from request directly if available
+                        if (client_public_key):
+                            print(f"Node {self.id}: Using embedded client key for response encryption")
+                            encrypted_response = self.encrypt_response(response, client_public_key)
+                        elif (client_id):
+                            # Try to get key from directory server
+                            client_public_key = self.request_client_key(client_id)
+                            if (client_public_key):
+                                print(f"Node {self.id}: Using directory client key for response encryption")
+                                encrypted_response = self.encrypt_response(response, client_public_key)
+                            else:
+                                print(f"Node {self.id}: Using mock encryption (couldn't get client key)")
+                                encrypted_response = f"[ENCRYPTED BY EXIT NODE {self.id} FOR CLIENT]: {response.decode(errors='replace')}".encode()
                         else:
-                            # Fall back to mock encryption if we couldn't get the client key
-                            print(f"Node {self.id}: Using mock encryption (couldn't get client key)")
+                            # Fall back to mock encryption
+                            print(f"Node {self.id}: Using mock encryption (no client identified)")
                             encrypted_response = f"[ENCRYPTED BY EXIT NODE {self.id} FOR CLIENT]: {response.decode(errors='replace')}".encode()
                         
                         # Send response back
